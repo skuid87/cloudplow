@@ -20,9 +20,6 @@
   - [Core](#core)
   - [Hidden](#hidden)
   - [Notifications](#notifications)
-  - [NZBGet](#nzbget)
-  - [Sabnzbd](#sabnzbd)
-  - [Plex](#plex)
   - [Remotes](#remotes)
   - [Uploader](#uploader)
   - [Syncer](#syncer)
@@ -41,7 +38,7 @@
 
 Cloudplow has 3 main functions:
 
-1. Automatic uploader to Rclone remote : Files are moved off local storage. With support for multiple uploaders (i.e. remote/folder pairings).
+1. Automatic uploader to Rclone remote: Files are moved off local storage. With support for multiple uploaders (i.e. remote/folder pairings).
 
 2. UnionFS Cleaner functionality: Deletion of UnionFS-Fuse whiteout files (`*_HIDDEN~`) and their corresponding "whited-out" files on Rclone remotes. With support for multiple remotes (useful if you have multiple Rclone remotes mounted).
 
@@ -299,6 +296,34 @@ Cloudplow has 3 main functions:
               "sync_remote": "google:/Backups",
               "upload_folder": "/mnt/local/Media",
               "upload_remote": "google:/Media"
+          },
+          "staging_to_google": {
+              "hidden_remote": "",
+              "rclone_excludes": [
+                  "**partial~",
+                  "**_HIDDEN~"
+              ],
+              "rclone_extras": {
+                  "--checkers": 16,
+                  "--drive-chunk-size": "64M",
+                  "--stats": "60s",
+                  "--transfers": 8,
+                  "--verbose": 1,
+                  "--drive-server-side-across-configs": null,
+                  "--user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/74.0.3729.131 Safari/537.36"
+              },
+              "rclone_sleeps": {
+                  "Failed to copy: googleapi: Error 403: User rate limit exceeded": {
+                      "count": 5,
+                      "sleep": 25,
+                      "timeout": 3600
+                  }
+              },
+              "rclone_command": "move",
+              "remove_empty_dir_depth": 2,
+              "sync_remote": "",
+              "upload_folder": "staging:/Media",
+              "upload_remote": "google:/Media"
           }
     },
     "syncer": {
@@ -375,6 +400,19 @@ Cloudplow has 3 main functions:
                     "--user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/74.0.3729.131 Safari/537.36"
                 }
             }
+        },
+        "staging_to_google": {
+            "check_interval": 30,
+            "exclude_open_files": false,
+            "max_size_gb": 500,
+            "opened_excludes": [],
+            "schedule": {
+                "allowed_from": "00:00",
+                "allowed_until": "23:59",
+                "enabled": false
+            },
+            "size_excludes": [],
+            "service_account_path":"/home/user/.config/cloudplow/service_accounts/"
         }
     }
 }
@@ -433,6 +471,7 @@ Notifications alerts for both scheduled and manual Cloudplow tasks.
 
 Supported `services`:
  - `apprise`
+ - `googlechat`
  - `pushover`
  - `slack`
 
@@ -535,91 +574,32 @@ _Note: The key name can be anything, but the `service` key must be must be the e
 
  - Default is `:heavy_exclamation_mark:`
 
+### Google Chat
 
-## NZBGet
-
-Cloudplow can pause the NZBGet download queue when an upload starts; and then resume it upon the upload finishing.
-
-```
-"nzbget": {
-    "enabled": false,
-    "url": "https://user:pass@nzbget.domain.com"
+```json
+"notifications": {
+    "GoogleChat": {
+        "service": "googlechat",
+        "webhook_url": "",
+        "thread_key": ""
+    }
 },
 ```
 
-`enabled` - `true` to enable.
+`webhook_url` - Webhook URL from Google Chat.
 
-`url` - Your NZBGet URL. Can be either `http://user:pass@localhost:6789` or `https://user:pass@nzbget.domain.com`.
+ - Required.
 
-## Sabnzbd
+ - To get a webhook URL:
+   1. Go to your Google Chat space
+   2. Click on the space name → "Manage webhooks"
+   3. Create a new webhook and copy the URL
 
-Cloudplow can pause the Sabnzbd download queue when an upload starts; and then resume it upon the upload finishing.
+`thread_key` - Optional thread key to send notifications to a specific thread.
 
-```
-"sabnzbd": {
-    "enabled": false,
-    "url": "https://sabnzbd.domain.com"
-    "apikey": "1314234234"
-},
-```
+ - Optional.
 
-`enabled` - `true` to enable.
-## Plex
-
-Cloudplow can throttle Rclone uploads during active, playing Plex streams (paused streams are ignored).
-
-
-```
-"plex": {
-    "enabled": true,
-    "max_streams_before_throttle": 1,
-    "ignore_local_streams": true,
-    "poll_interval": 60,
-    "notifications": false,
-    "rclone": {
-        "throttle_speeds": {
-            "0": "1000M",
-            "1": "50M",
-            "2": "40M",
-            "3": "30M",
-            "4": "20M",
-            "5": "10M"
-        },
-        "url": "http://localhost:7949"
-    },
-    "token": "",
-    "url": "https://plex.domain.com"
-},
-```
-
-
-`enabled` - `true` to enable.
-
-`url` - Your Plex URL. Can be either `http://localhost:32400` or `https://plex.domain.com`.
-
-`token` - Your Plex Access Token.
-
-- Run the Plex Token script by [Werner Beroux](https://github.com/wernight): `/opt/cloudplow/scripts/plex_token.sh`.
-
-  or
-
-- Visit https://support.plex.tv/hc/en-us/articles/204059436-Finding-an-authentication-token-X-Plex-Token
-
-`poll_interval` - How often (in seconds) Plex is checked for active streams.
-
-`max_streams_before_throttle` - How many playing streams are allowed before enabling throttling.
-
-`ignore_local_streams` - Whether streaming local files should count for throttling.
-
-`notifications` - Send notifications when throttling is set, adjusted, or unset, depending on stream count.
-
-`rclone`
-
-- `url` - Leave as default.
-
-- `throttle_speed` - Categorized option to configure upload speeds for various stream counts (where `5` represents 5 streams or more). Stream count `0` represents speeds when no active stream is playing. `M` is MB/s.
-
-  - Format: `"STREAM COUNT": "THROTTLED UPLOAD SPEED",`
+ - Default is blank (creates a new thread for each notification).
 
 
 ## Remotes
@@ -749,9 +729,37 @@ This is the depth to min-depth to delete empty folders from relative to `upload_
 #### Local/Remote Paths
 
 
-`"upload_folder"`: is the local path that is uploaded by the `uploader` task, once it reaches the size threshold as specified in `max_size_gb`.
+`"upload_folder"`: is the path (local or rclone remote) that is uploaded by the `uploader` task, once it reaches the size threshold as specified in `max_size_gb`.
 
-`"upload_remote"`: is the remote path that the `uploader` task will uploaded to.
+- **Local path example**: `"/mnt/local/Media/"` - uploads from a local directory
+- **Remote path example**: `"staging:/Media/"` - uploads from an rclone remote to another remote
+
+`"upload_remote"`: is the remote path that the `uploader` task will upload to.
+
+##### Remote-to-Remote Uploads
+
+Cloudplow now supports uploading from one rclone remote to another rclone remote. This is useful for:
+- Moving data between cloud providers (e.g., staging remote to production remote)
+- Server-side transfers that don't require local disk space
+- Multi-tiered storage workflows
+
+To configure remote-to-remote uploads, simply specify an rclone remote path in the `upload_folder` field:
+
+```json
+"remotes": {
+    "google": {
+        "upload_folder": "staging:/Media",
+        "upload_remote": "google:/Media",
+        ...
+    }
+}
+```
+
+**Notes for remote-to-remote uploads:**
+- The `exclude_open_files` check is automatically skipped for remote sources (only applicable to local paths)
+- Size checking uses `rclone size` instead of local `du` command
+- Empty directory removal is skipped for remote sources (use `rclone rmdirs` manually if needed)
+- All other features (service accounts, triggers, schedules) work the same as local-to-remote uploads
 
 #### Sync From/To Paths
 
@@ -789,8 +797,6 @@ If multiple uploader tasks are specified, the tasks will run sequentially (vs in
 ```
 
 In the example above, the uploader references `"google"` from the `remotes` section.
-
-`"can_be_throttled"`: When this attribute is missing or set to `true`, this uploader can be throttled if enabled in the Plex config section. When set to `false`, no throttling will be attempted on this uploader.
 
 `"check_interval"`: How often (in minutes) to check the size of this remotes `upload_folder`. Once it reaches the size threshold as specified in `max_size_gb`, the uploader will start.
 

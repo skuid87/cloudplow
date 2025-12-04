@@ -13,35 +13,6 @@
     },
     "notifications": {
     },
-    "nzbget": {
-        "enabled": false,
-        "url": "https://user:pass@nzbget.domain.com"
-    },
-    "sabnzbd": {
-        "enabled": false,
-        "url": "https://sabnzbd.domain.com",
-        "apikey": "1314234234"
-    },
-    "plex": {
-        "enabled": false,
-        "url": "http://localhost:32400",
-        "token": "",
-        "poll_interval": 60,
-        "max_streams_before_throttle": 1,
-        "ignore_local_streams": true,
-        "notifications": false,
-        "rclone": {
-            "throttle_speeds": {
-                "0": "100M",
-                "1": "50M",
-                "2": "40M",
-                "3": "30M",
-                "4": "20M",
-                "5": "10M"
-            },
-            "url": "http://localhost:7949"
-        }
-    },
     "remotes": {
         "google": {
             "hidden_remote": "google:",
@@ -85,7 +56,6 @@
     },
     "uploader": {
         "google": {
-            "can_be_throttled": true,
             "check_interval": 30,
             "exclude_open_files": true,
             "max_size_gb": 200,

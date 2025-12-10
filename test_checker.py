@@ -9,7 +9,7 @@ import os
 # Add cloudplow to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from utils.rclone import RcloneUploader
+from utils.uploader import Uploader
 from utils.config import Config
 
 def main():
@@ -17,6 +17,7 @@ def main():
     
     # Load your config
     conf = Config()
+    conf.load()
     
     # Get your uploader config for gdrive-2025
     uploader_name = 'gdrive-2025'
@@ -33,34 +34,23 @@ def main():
     print(f"Source: {rclone_config['upload_folder']}")
     print(f"Destination: {rclone_config['upload_remote']}")
     
-    # Determine service account (if applicable)
-    service_account = None
-    if 'service_account_path' in conf.configs['remotes'][uploader_name]:
-        sa_path = conf.configs['remotes'][uploader_name]['service_account_path']
-        if sa_path and os.path.exists(sa_path):
-            # Get first service account for testing
-            sa_files = [f for f in os.listdir(sa_path) if f.endswith('.json')]
-            if sa_files:
-                service_account = os.path.join(sa_path, sa_files[0])
-                print(f"Using service account: {service_account}")
-    
-    # Create the RcloneUploader instance
-    print("\nCreating RcloneUploader instance...")
-    rclone = RcloneUploader(
+    # Create the Uploader instance (handles service accounts internally)
+    print("\nCreating Uploader instance...")
+    uploader = Uploader(
         uploader_name,
+        uploader_config,
         rclone_config,
         conf.configs['core']['rclone_binary_path'],
         conf.configs['core']['rclone_config_path'],
         conf.configs['plex'],
-        dry_run=False,
-        service_account=service_account
+        conf.configs['core']['dry_run']
     )
     
-    # Run the check
+    # Run the check using get_pending_info (same as cloudplow does)
     print("\nRunning pending files check (this may take a few minutes)...")
     print("-" * 60)
     
-    result = rclone.check_pending_files()
+    result = uploader.get_pending_info()
     
     print("-" * 60)
     

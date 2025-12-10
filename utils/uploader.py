@@ -9,7 +9,7 @@ log = logging.getLogger("uploader")
 
 
 class Uploader:
-    def __init__(self, name, uploader_config, rclone_config, rclone_binary_path, rclone_config_path, dry_run):
+    def __init__(self, name, uploader_config, rclone_config, rclone_binary_path, rclone_config_path, plex, dry_run):
         self.name = name
         self.uploader_config = uploader_config
         self.rclone_config = rclone_config
@@ -18,6 +18,7 @@ class Uploader:
         self.delayed_trigger = ""
         self.rclone_binary_path = rclone_binary_path
         self.rclone_config_path = rclone_config_path
+        self.plex = plex
         self.dry_run = dry_run
         self.service_account = None
 
@@ -27,13 +28,6 @@ class Uploader:
 
     def upload(self):
         rclone_config = self.rclone_config.copy()
-
-        # Detect and log upload mode
-        upload_source = rclone_config['upload_folder']
-        if path.is_rclone_remote(upload_source):
-            log.info(f"Remote-to-remote upload mode detected: {upload_source} -> {rclone_config['upload_remote']}")
-        else:
-            log.info(f"Local-to-remote upload mode detected: {upload_source} -> {rclone_config['upload_remote']}")
 
         # should we exclude open files
         if self.uploader_config['exclude_open_files']:
@@ -47,10 +41,17 @@ class Uploader:
         # do upload
         if self.service_account is not None:
             rclone = RcloneUploader(self.name, rclone_config, self.rclone_binary_path, self.rclone_config_path,
-                                    self.dry_run, self.service_account)
+                                    self.plex, self.dry_run, self.service_account)
         else:
             rclone = RcloneUploader(self.name, rclone_config, self.rclone_binary_path, self.rclone_config_path,
-                                    self.dry_run)
+                                    self.plex, self.dry_run)
+
+        # check pending files before upload
+        pending_info = rclone.check_pending_files()
+        if pending_info:
+            log.info(f"Files pending: {pending_info['pending_count']} ({pending_info['pending_size_gb']} GB), "
+                     f"Already synced: {pending_info['synced_count']} ({pending_info['synced_size_gb']} GB), "
+                     f"Progress: {pending_info['percent_complete']}%")
 
         log.info(f"Uploading '{rclone_config['upload_folder']}' to remote: {self.name}")
         self.delayed_check = 0
@@ -80,7 +81,7 @@ class Uploader:
         else:
             self.delayed_trigger = f"Unhandled situation: Exit code: {return_code} - Upload Status: {upload_status}"
 
-        return self.delayed_check, self.delayed_trigger, success
+        return self.delayed_check, self.delayed_trigger, success, pending_info
 
     def remove_empty_dirs(self):
         path.remove_empty_dirs(self.rclone_config['upload_folder'], self.rclone_config['remove_empty_dir_depth'])

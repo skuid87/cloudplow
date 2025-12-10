@@ -8,6 +8,8 @@ import requests
 import urllib3
 import subprocess
 import jsonpickle
+import json
+import tempfile
 from . import process, misc
 
 try:
@@ -21,10 +23,11 @@ urllib3.disable_warnings()
 
 
 class RcloneMover:
-    def __init__(self, config, rclone_binary_path, rclone_config_path, dry_run=False):
+    def __init__(self, config, rclone_binary_path, rclone_config_path, plex, dry_run=False):
         self.config = config
         self.rclone_binary_path = rclone_binary_path
         self.rclone_config_path = rclone_config_path
+        self.plex = plex
         self.dry_run = dry_run
 
     def move(self):
@@ -40,6 +43,10 @@ class RcloneMover:
             excludes = self.__excludes2string()
             if len(excludes) > 2:
                 cmd += f' {excludes}'
+            if self.plex.get('enabled'):
+                r = re.compile(r"https?://(www\.)?")
+                rc_url = r.sub('', self.plex['rclone']['url']).strip().strip('/')
+                cmd += f' --rc --rc-addr={cmd_quote(rc_url)}'
             if self.dry_run:
                 cmd += ' --dry-run'
 
@@ -68,12 +75,13 @@ class RcloneMover:
 
 
 class RcloneUploader:
-    def __init__(self, name, config, rclone_binary_path, rclone_config_path, dry_run=False,
+    def __init__(self, name, config, rclone_binary_path, rclone_config_path, plex, dry_run=False,
                  service_account=None):
         self.name = name
         self.config = config
         self.rclone_binary_path = rclone_binary_path
         self.rclone_config_path = rclone_config_path
+        self.plex = plex
         self.dry_run = dry_run
         self.service_account = service_account
 
@@ -106,17 +114,127 @@ class RcloneUploader:
 
         return False
 
+    def check_pending_files(self):
+        try:
+            log.info(f"Checking pending files for '{self.config['upload_folder']}' against '{self.config['upload_remote']}'")
+            
+            # Step 1: Get total source size with --fast-list
+            cmd = f"{cmd_quote(self.rclone_binary_path)} size --json --fast-list {cmd_quote(self.config['upload_folder'])} --config={cmd_quote(self.rclone_config_path)}"
+            log.debug(f"Getting total source size: {cmd}")
+            total_output = process.popen(cmd)
+            
+            if not total_output:
+                log.error("Failed to get total source size")
+                return None
+            
+            total_info = json.loads(total_output)
+            total_size = total_info['bytes']
+            total_count = total_info['count']
+            log.debug(f"Total source: {total_count} files, {total_size} bytes")
+            
+            # Step 2: Run check with --combined and --fast-list
+            combined_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt')
+            combined_path = combined_file.name
+            combined_file.close()
+            
+            cmd = f"{cmd_quote(self.rclone_binary_path)} check --one-way --combined {cmd_quote(combined_path)} --fast-list {cmd_quote(self.config['upload_folder'])} {cmd_quote(self.config['upload_remote'])} --config={cmd_quote(self.rclone_config_path)}"
+            log.debug(f"Running check: {cmd}")
+            
+            # Run the check command (it may have non-zero exit if differences found, which is expected)
+            try:
+                process.popen(cmd)
+            except Exception:
+                # Check command returns non-zero when differences are found, this is expected
+                pass
+            
+            # Step 3: Parse combined file and collect pending file paths
+            pending_files = []
+            synced_count = 0
+            missing_count = 0
+            modified_count = 0
+            
+            try:
+                with open(combined_path, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.startswith('='):
+                            synced_count += 1
+                        elif line.startswith('-'):
+                            missing_count += 1
+                            pending_files.append(line[2:].strip())
+                        elif line.startswith('*'):
+                            modified_count += 1
+                            pending_files.append(line[2:].strip())
+                
+                log.debug(f"Check results - Synced: {synced_count}, Missing: {missing_count}, Modified: {modified_count}")
+            finally:
+                # Clean up combined file
+                try:
+                    os.unlink(combined_path)
+                except Exception:
+                    pass
+            
+            # Step 4: Get sizes for pending files with --fast-list
+            pending_size = 0
+            pending_count = len(pending_files)
+            
+            if pending_files:
+                pending_list_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt')
+                pending_list_path = pending_list_file.name
+                
+                try:
+                    with open(pending_list_path, 'w') as f:
+                        f.write('\n'.join(pending_files))
+                    
+                    cmd = f"{cmd_quote(self.rclone_binary_path)} size --files-from-raw {cmd_quote(pending_list_path)} --json --fast-list {cmd_quote(self.config['upload_folder'])} --config={cmd_quote(self.rclone_config_path)}"
+                    log.debug(f"Getting pending files size: {cmd}")
+                    pending_output = process.popen(cmd)
+                    
+                    if pending_output:
+                        pending_info = json.loads(pending_output)
+                        pending_size = pending_info['bytes']
+                        pending_count = pending_info['count']
+                        log.debug(f"Pending: {pending_count} files, {pending_size} bytes")
+                finally:
+                    # Clean up pending list file
+                    try:
+                        os.unlink(pending_list_path)
+                    except Exception:
+                        pass
+            
+            # Step 5: Calculate synced size
+            synced_size = total_size - pending_size
+            
+            # Step 6: Calculate percentage based on size
+            percent = (synced_size / total_size * 100) if total_size > 0 else 100.0
+            
+            result = {
+                'pending_count': pending_count,
+                'pending_size_bytes': pending_size,
+                'pending_size_gb': round(pending_size / (1024**3), 2),
+                'synced_count': synced_count,
+                'synced_size_bytes': synced_size,
+                'synced_size_gb': round(synced_size / (1024**3), 2),
+                'total_count': total_count,
+                'total_size_bytes': total_size,
+                'total_size_gb': round(total_size / (1024**3), 2),
+                'missing_count': missing_count,
+                'modified_count': modified_count,
+                'percent_complete': round(percent, 1)
+            }
+            
+            log.info(f"Check complete - {result['pending_size_gb']} GB pending ({result['pending_count']} files), {result['percent_complete']}% synced")
+            return result
+            
+        except Exception:
+            log.exception(f"Exception occurred while checking pending files for '{self.config['upload_folder']}':")
+            return None
+
     def upload(self, callback):
         try:
-            upload_source = self.config['upload_folder']
-            upload_dest = self.config['upload_remote']
-            
-            # Log upload mode
-            if ':' in upload_source and not (len(upload_source) > 2 and upload_source[1] == ':'):
-                log.info(f"Executing remote-to-remote upload: {upload_source} -> {upload_dest}")
-            else:
-                log.debug(f"Uploading '{upload_source}' to '{upload_dest}'")
-            
+            log.debug(f"Uploading '{self.config['upload_folder']}' to '{self.config['upload_remote']}'")
             log.debug(f"Rclone command set to '{self.config['rclone_command'] if ('rclone_command' in self.config and self.config['rclone_command'].lower() != 'sync') else 'move'}'")
             # build cmd
             cmd = f"{cmd_quote(self.rclone_binary_path)} {cmd_quote(self.config['rclone_command'] if ('rclone_command' in self.config and self.config['rclone_command'].lower() != 'sync') else 'move')} {cmd_quote(self.config['upload_folder'])} {cmd_quote(self.config['upload_remote'])} --config={cmd_quote(self.rclone_config_path)}"
@@ -216,6 +334,10 @@ class RcloneUploader:
             excludes = self.__excludes2string()
             if len(excludes) > 2:
                 cmd += f' {excludes}'
+            if self.plex.get('enabled'):
+                r = re.compile(r"https?://(www\.)?")
+                rc_url = r.sub('', self.plex['rclone']['url']).strip().strip('/')
+                cmd += f' --rc --rc-addr={cmd_quote(rc_url)}'
             if self.dry_run:
                 cmd += ' --dry-run'
 
@@ -330,3 +452,72 @@ class RcloneSyncer:
     def __extras2string(self):
         return ' '.join(f"{key}={cmd_quote(value) if isinstance(value, str) else value}" for (key, value) in
                         self.rclone_extras.items()).replace('=None', '').strip()
+
+
+class RcloneThrottler:
+    def __init__(self, url):
+        self.url = url
+
+    def validate(self):
+        success = False
+        payload = {'validated': True}
+        try:
+            resp = requests.post(urljoin(self.url, 'rc/noop'), json=payload, timeout=15, verify=False)
+            if '{' in resp.text and '}' in resp.text:
+                data = resp.json()
+                success = data['validated']
+        except Exception:
+            log.exception("Exception validating rc url %s: ", self.url)
+        return success
+
+    def throttle_active(self, speed):
+        if speed:
+            try:
+                resp = requests.post(urljoin(self.url, 'core/stats'), timeout=15, verify=False)
+                if '{' in resp.text and '}' in resp.text:
+                    data = resp.json()
+                    if 'transferring' in data and len(data['transferring']) > 0:
+                        # Sum total speed of all active transfers to determine if greater than current_speed
+                        current_speed = sum(
+                            float(transfer['speed'])
+                            for transfer in data['transferring']
+                        )
+
+                        return (current_speed / 1000000) - 10 <= float(speed.rstrip('M'))
+            except Exception:
+                log.exception("Exception checking if throttle currently active")
+
+        return False
+
+    def throttle(self, speed):
+        success = False
+        payload = {'rate': speed}
+        try:
+            resp = requests.post(urljoin(self.url, 'core/bwlimit'), json=payload, timeout=15, verify=False)
+            if '{' in resp.text and '}' in resp.text:
+                data = resp.json()
+                if 'error' in data:
+                    log.error("Failed to throttle %s: %s", self.url, data['error'])
+                elif 'rate' in data and speed in data['rate']:
+                    log.warning("Successfully throttled %s to %s.", self.url, speed)
+                    success = True
+
+        except Exception:
+            log.exception("Exception sending throttle request to %s: ", self.url)
+        return success
+
+    def no_throttle(self):
+        success = False
+        payload = {'rate': 'off'}
+        try:
+            resp = requests.post(urljoin(self.url, 'core/bwlimit'), json=payload, timeout=15, verify=False)
+            if '{' in resp.text and '}' in resp.text:
+                data = resp.json()
+                if 'error' in data:
+                    log.error("Failed to un-throttle %s: %s", self.url, data['error'])
+                elif 'rate' in data and data['rate'] == 'off':
+                    log.warning("Successfully un-throttled %s", self.url)
+                    success = True
+        except Exception:
+            log.exception("Exception sending un-throttle request to %s: ", self.url)
+        return success

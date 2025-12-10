@@ -12,7 +12,10 @@ import schedule
 from utils import config, lock, path, decorators, version, misc
 from utils.cache import Cache
 from utils.notifications import Notifications
-from utils.rclone import RcloneMover
+from utils.nzbget import Nzbget
+from utils.sabnzbd import Sabnzbd
+from utils.plex import Plex
+from utils.rclone import RcloneThrottler, RcloneMover
 from utils.syncer import Syncer
 from utils.threads import Thread
 from utils.unionfs import UnionfsHiddenFolder
@@ -76,6 +79,7 @@ thread = Thread()
 # Logic vars
 uploader_delay = cache.get_cache('uploader_bans')
 syncer_delay = cache.get_cache('syncer_bans')
+plex_monitor_thread = None
 sa_delay = cache.get_cache('sa_bans')
 
 
@@ -239,8 +243,14 @@ def run_process(task, manager_dict, **kwargs):
 
 @decorators.timed
 def do_upload(remote=None):
-    global uploader_delay
+    global plex_monitor_thread, uploader_delay
     global sa_delay
+
+    nzbget = None
+    nzbget_paused = False
+
+    sabnzbd = None
+    sabnzbd_paused = False
 
     lock_file = lock.upload()
     if lock_file.is_locked():
@@ -258,15 +268,50 @@ def do_upload(remote=None):
                 # retrieve rclone config for this remote
                 rclone_config = conf.configs['remotes'][uploader_remote]
 
-                # send notification that upload is starting
-                notify.send(message=f"Upload of {path.get_size(rclone_config['upload_folder'], uploader_config['size_excludes'])} GB has begun for remote: {uploader_remote}")
-
+                # create uploader early to check pending files for notification
                 uploader = Uploader(uploader_remote,
                                     uploader_config,
                                     rclone_config,
                                     conf.configs['core']['rclone_binary_path'],
                                     conf.configs['core']['rclone_config_path'],
+                                    conf.configs['plex'],
                                     conf.configs['core']['dry_run'])
+
+                # send notification that upload is starting with pending file info
+                total_size_gb = path.get_size(rclone_config['upload_folder'], uploader_config['size_excludes'])
+                notify.send(message=f"Upload of {total_size_gb} GB has begun for remote: {uploader_remote}")
+
+                # start the plex stream monitor before the upload begins, if enabled for both plex and the uploader
+                if conf.configs['plex']['enabled'] and plex_monitor_thread is None:
+                    # Only disable throttling if 'can_be_throttled' is both present in uploader_config and is set to False.
+                    if 'can_be_throttled' in uploader_config and not uploader_config['can_be_throttled']:
+                        log.debug(f"Skipping check for Plex stream due to throttling disabled in remote: {uploader_remote}")
+                    # Otherwise, assume throttling is desired.
+                    else:
+                        plex_monitor_thread = thread.start(do_plex_monitor, 'plex-monitor')
+
+                # pause the nzbget queue before starting the upload, if enabled
+                if conf.configs['nzbget']['enabled']:
+                    nzbget = Nzbget(conf.configs['nzbget']['url'])
+                    if nzbget.pause_queue():
+                        nzbget_paused = True
+                        log.info("Paused the Nzbget download queue, upload commencing!")
+                        notify.send(message="Paused the Nzbget download queue, upload commencing!")
+                    else:
+                        log.error("Failed to pause the Nzbget download queue, upload commencing anyway...")
+                        notify.send(message="Failed to pause the Nzbget download queue, upload commencing anyway...")
+
+                # pause the sabnzbd queue before starting the upload, if enabled
+                if conf.configs['sabnzbd']['enabled']:
+                    sabnzbd = Sabnzbd(conf.configs['sabnzbd']['url'], conf.configs['sabnzbd']['apikey'])
+                    if sabnzbd.pause_queue():
+                        sabnzbd_paused = True
+                        log.info("Paused the Sabnzbd download queue, upload commencing!")
+                        notify.send(message="Paused the Sabnzbd download queue, upload commencing!")
+                    else:
+                        print(sabnzbd.pause_queue())
+                        log.error("Failed to pause the Sabnzbd download queue, upload commencing anyway...")
+                        notify.send(message="Failed to pause the Sabnzbd download queue, upload commencing anyway...")
 
                 if sa_delay[uploader_remote] is not None:
                     available_accounts = [account for account, last_ban_time in sa_delay[uploader_remote].items() if
@@ -289,7 +334,7 @@ def do_upload(remote=None):
                     else:
                         for i in range(available_accounts_size):
                             uploader.set_service_account(available_accounts[i])
-                            resp_delay, resp_trigger, resp_success = uploader.upload()
+                            resp_delay, resp_trigger, resp_success, pending_info = uploader.upload()
                             if resp_delay:
                                 current_data = sa_delay[uploader_remote]
                                 current_data[available_accounts[i]] = time.time() + ((60 * 60) * resp_delay)
@@ -321,8 +366,11 @@ def do_upload(remote=None):
                             else:
                                 if resp_success:
                                     log.info(f"Upload completed successfully for uploader: {uploader_remote}")
-                                    # send successful upload notification
-                                    notify.send(message=f"Upload was completed successfully for remote: {uploader_remote}")
+                                    # send successful upload notification with pending info
+                                    if pending_info:
+                                        notify.send(message=f"Upload completed for {uploader_remote}. Synced: {pending_info['synced_size_gb']} GB ({pending_info['synced_count']} files, {pending_info['percent_complete']}% complete). Pending: {pending_info['pending_size_gb']} GB ({pending_info['pending_count']} files - {pending_info['missing_count']} new, {pending_info['modified_count']} modified)")
+                                    else:
+                                        notify.send(message=f"Upload was completed successfully for remote: {uploader_remote}")
                                 else:
                                     log.info(f"Upload not completed successfully for uploader: {uploader_remote}")
                                     # send unsuccessful upload notification
@@ -332,7 +380,7 @@ def do_upload(remote=None):
                                 sa_delay[uploader_remote][available_accounts[i]] = None
                                 break
                 else:
-                    resp_delay, resp_trigger, resp_success = uploader.upload()
+                    resp_delay, resp_trigger, resp_success, pending_info = uploader.upload()
                     if resp_delay:
                         if uploader_remote not in uploader_delay:
                             # this uploader was not already in the delay dict, so lets put it there
@@ -349,8 +397,11 @@ def do_upload(remote=None):
                     else:
                         if resp_success:
                             log.info(f"Upload completed successfully for uploader: {uploader_remote}")
-                            # send successful upload notification
-                            notify.send(message=f"Upload was completed successfully for remote: {uploader_remote}")
+                            # send successful upload notification with pending info
+                            if pending_info:
+                                notify.send(message=f"Upload completed for {uploader_remote}. Synced: {pending_info['synced_size_gb']} GB ({pending_info['synced_count']} files, {pending_info['percent_complete']}% complete). Pending: {pending_info['pending_size_gb']} GB ({pending_info['pending_count']} files - {pending_info['missing_count']} new, {pending_info['modified_count']} modified)")
+                            else:
+                                notify.send(message=f"Upload was completed successfully for remote: {uploader_remote}")
                         else:
                             log.info(f"Upload not completed successfully for uploader: {uploader_remote}")
                             # send unsuccessful upload notification
@@ -364,6 +415,25 @@ def do_upload(remote=None):
                 # remove leftover empty directories from disk
                 if not conf.configs['core']['dry_run']:
                     uploader.remove_empty_dirs()
+
+                # resume the nzbget queue, if enabled
+                if conf.configs['nzbget']['enabled'] and nzbget is not None and nzbget_paused:
+                    if nzbget.resume_queue():
+                        nzbget_paused = False
+                        log.info("Resumed the Nzbget download queue!")
+                        notify.send(message="Resumed the Nzbget download queue!")
+                    else:
+                        log.error("Failed to resume the Nzbget download queue??")
+                        notify.send(message="Failed to resume the Nzbget download queue??")
+                # resume the Sabnzbd queue, if enabled
+                if conf.configs['sabnzbd']['enabled'] and sabnzbd is not None and sabnzbd_paused:
+                    if sabnzbd.resume_queue():
+                        sabnzbd_paused = False
+                        log.info("Resumed the Sabnzbd download queue!")
+                        notify.send(message="Resumed the Sabnzbd download queue!")
+                    else:
+                        log.error("Failed to resume the Sabnzbd download queue??")
+                        notify.send(message="Failed to resume the Sabnzbd download queue??")
 
                 # move from staging remote to main ?
                 if 'mover' in uploader_config and 'enabled' in uploader_config['mover']:
@@ -385,6 +455,7 @@ def do_upload(remote=None):
                         mover = RcloneMover(uploader_config['mover'],
                                             conf.configs['core']['rclone_binary_path'],
                                             conf.configs['core']['rclone_config_path'],
+                                            conf.configs['plex'],
                                             conf.configs['core']['dry_run'])
                         log.info(f"Move starting from {uploader_config['mover']['move_from_remote']} -> {uploader_config['mover']['move_to_remote']}")
 
@@ -530,6 +601,103 @@ def do_hidden():
             log.exception("Exception occurred while cleaning hiddens: ")
 
     log.info("Finished hidden cleaning")
+
+
+@decorators.timed
+def do_plex_monitor():
+    global plex_monitor_thread
+
+    # create the plex object
+    plex = Plex(conf.configs['plex']['url'], conf.configs['plex']['token'])
+    if not plex.validate():
+        log.error("Aborting Plex Media Server stream monitor due to failure to validate supplied server URL and/or Token.")
+        plex_monitor_thread = None
+        return
+
+    # sleep 15 seconds to allow rclone to start
+    log.info("Plex Media Server URL + Token were validated. Sleeping for 15 seconds before checking Rclone RC URL.")
+    time.sleep(15)
+
+    # create the rclone throttle object
+    rclone = RcloneThrottler(conf.configs['plex']['rclone']['url'])
+    if not rclone.validate():
+        log.error("Aborting Plex Media Server stream monitor due to failure to validate supplied Rclone RC URL.")
+        plex_monitor_thread = None
+        return
+    else:
+        log.info("Rclone RC URL was validated. Stream monitoring for Plex Media Server will now begin.")
+
+    throttled = False
+    throttle_speed = None
+    lock_file = lock.upload()
+    while lock_file.is_locked():
+        streams = plex.get_streams()
+        if streams is None:
+            log.error(f"Failed to check Plex Media Server stream(s). Trying again in {conf.configs['plex']['poll_interval']} seconds...")
+        else:
+            # we had a response
+            stream_count = sum(
+                stream.state in ['playing', 'buffering'] and not stream.local
+                for stream in streams
+            )
+            local_stream_count = sum(
+                stream.state in ['playing', 'buffering'] and stream.local
+                for stream in streams
+            )
+
+            # if we are accounting for local streams, add them to the stream count
+            if not conf.configs['plex']['ignore_local_streams']:
+                stream_count += local_stream_count
+
+            # are we already throttled?
+            if ((not throttled or (throttled and not rclone.throttle_active(throttle_speed))) and (
+                    stream_count >= conf.configs['plex']['max_streams_before_throttle'])):
+                log.info(f"There was {stream_count} playing stream(s) on Plex Media Server while it was currently un-throttled.")
+                for stream in streams:
+                    log.info(stream)
+                log.info("Upload throttling will now commence.")
+
+                # send throttle request
+                throttle_speed = misc.get_nearest_less_element(conf.configs['plex']['rclone']['throttle_speeds'],
+                                                               stream_count)
+                throttled = rclone.throttle(throttle_speed)
+
+                # send notification
+                if throttled and conf.configs['plex']['notifications']:
+                    notify.send(message=f"Throttled current upload to {throttle_speed} because there was {stream_count} playing stream(s) on Plex")
+
+            elif throttled:
+                if stream_count < conf.configs['plex']['max_streams_before_throttle']:
+                    log.info(f"There was less than {conf.configs['plex']['max_streams_before_throttle']} playing stream(s) on Plex Media Server while it was currently throttled. Removing throttle ...")
+                    # send un-throttle request
+                    throttled = not rclone.no_throttle()
+                    throttle_speed = None
+
+                    # send notification
+                    if not throttled and conf.configs['plex']['notifications']:
+                        notify.send(message=f"Un-throttled current upload because there was less than {conf.configs['plex']['max_streams_before_throttle']} playing stream(s) on Plex Media Server")
+
+                elif misc.get_nearest_less_element(conf.configs['plex']['rclone']['throttle_speeds'],
+                                                   stream_count) != throttle_speed:
+                    # throttle speed changed, probably due to more/fewer streams, re-throttle
+                    throttle_speed = misc.get_nearest_less_element(conf.configs['plex']['rclone']['throttle_speeds'],
+                                                                   stream_count)
+                    log.info(f"Adjusting throttle speed for current upload to {throttle_speed} because there was now {stream_count} playing stream(s) on Plex Media Server")
+
+                    throttled = rclone.throttle(throttle_speed)
+
+                    # send notification
+                    if throttled and conf.configs['plex']['notifications']:
+                        notify.send(message=f'Throttle for current upload was adjusted to {throttle_speed} due to {stream_count} playing stream(s) on Plex Media Server')
+
+                else:
+                    log.info(f"There was {stream_count} playing stream(s) on Plex Media Server it was already throttled to {throttle_speed}. Throttling will continue.")
+
+        # the lock_file exists, so we can assume an upload is in progress at this point
+        time.sleep(conf.configs['plex']['poll_interval'])
+
+    log.info("Finished monitoring Plex stream(s)!")
+    plex_monitor_thread = None
 
 
 ############################################################

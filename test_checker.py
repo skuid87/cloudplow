@@ -46,6 +46,19 @@ def main():
         conf.configs['core']['dry_run']
     )
     
+    # Set service account if available (same as cloudplow does)
+    if 'service_account_path' in uploader_config and os.path.exists(uploader_config['service_account_path']):
+        sa_path = uploader_config['service_account_path']
+        sa_files = [f for f in os.listdir(sa_path) if f.endswith('.json')]
+        if sa_files:
+            service_account = os.path.join(sa_path, sa_files[0])
+            uploader.set_service_account(service_account)
+            print(f"Using service account: {service_account}")
+        else:
+            print(f"Warning: No service account files found in {sa_path}")
+    else:
+        print("Note: No service account path configured or path doesn't exist")
+    
     # Run the check using get_pending_info (same as cloudplow does)
     print("\nRunning pending files check (this may take a few minutes)...")
     print("-" * 60)

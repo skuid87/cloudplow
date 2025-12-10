@@ -138,6 +138,12 @@ class RcloneUploader:
             combined_file.close()
             
             cmd = f"{cmd_quote(self.rclone_binary_path)} check --one-way --combined {cmd_quote(combined_path)} --fast-list {cmd_quote(self.config['upload_folder'])} {cmd_quote(self.config['upload_remote'])} --config={cmd_quote(self.rclone_config_path)}"
+            
+            # Add excludes to match upload behavior
+            excludes = self.__excludes2string()
+            if len(excludes) > 2:
+                cmd += f' {excludes}'
+            
             log.debug(f"Running check: {cmd}")
             
             # Run the check command (it may have non-zero exit if differences found, which is expected)

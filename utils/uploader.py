@@ -26,6 +26,30 @@ class Uploader:
         self.service_account = sa_file
         log.info(f"Using service account: {sa_file}")
 
+    def get_pending_info(self):
+        """Get pending file information without starting upload."""
+        rclone_config = self.rclone_config.copy()
+
+        # should we exclude open files
+        if self.uploader_config['exclude_open_files']:
+            files_to_exclude = self.__opened_files()
+            if len(files_to_exclude):
+                log.info(f"Excluding these files from pending check because they were open: {files_to_exclude}")
+                # add files_to_exclude to rclone_config
+                for item in files_to_exclude:
+                    rclone_config['rclone_excludes'].append(glob.escape(item))
+
+        # create rclone uploader
+        if self.service_account is not None:
+            rclone = RcloneUploader(self.name, rclone_config, self.rclone_binary_path, self.rclone_config_path,
+                                    self.plex, self.dry_run, self.service_account)
+        else:
+            rclone = RcloneUploader(self.name, rclone_config, self.rclone_binary_path, self.rclone_config_path,
+                                    self.plex, self.dry_run)
+
+        # check pending files
+        return rclone.check_pending_files()
+
     def upload(self):
         rclone_config = self.rclone_config.copy()
 

@@ -277,9 +277,22 @@ def do_upload(remote=None):
                                     conf.configs['plex'],
                                     conf.configs['core']['dry_run'])
 
+                # get pending file information for notification
+                pending_info = uploader.get_pending_info()
+                
                 # send notification that upload is starting with pending file info
-                total_size_gb = path.get_size(rclone_config['upload_folder'], uploader_config['size_excludes'])
-                notify.send(message=f"Upload of {total_size_gb} GB has begun for remote: {uploader_remote}")
+                if pending_info:
+                    notify.send(message=f"Upload starting for {uploader_remote}: "
+                                f"{pending_info['pending_size_gb']} GB pending "
+                                f"({pending_info['pending_count']} files - "
+                                f"{pending_info['missing_count']} new, "
+                                f"{pending_info['modified_count']} modified), "
+                                f"{pending_info['synced_size_gb']} GB already synced "
+                                f"({pending_info['percent_complete']}% complete)")
+                else:
+                    # Fallback to old notification if check failed
+                    total_size_gb = path.get_size(rclone_config['upload_folder'], uploader_config['size_excludes'])
+                    notify.send(message=f"Upload of {total_size_gb} GB has begun for remote: {uploader_remote}")
 
                 # start the plex stream monitor before the upload begins, if enabled for both plex and the uploader
                 if conf.configs['plex']['enabled'] and plex_monitor_thread is None:

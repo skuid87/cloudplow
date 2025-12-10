@@ -118,10 +118,111 @@ class RcloneUploader:
         try:
             log.info(f"Checking pending files for '{self.config['upload_folder']}' against '{self.config['upload_remote']}'")
             
+            # Setup subprocess environment (same as upload method)
+            subprocess_env = os.environ.copy()
+            
+            if self.service_account is not None:
+                rclone_data = subprocess.check_output(f'rclone config dump --config={cmd_quote(self.rclone_config_path)}', shell=True)
+                rclone_remotes = jsonpickle.decode(rclone_data)
+                config_remote = self.config['upload_remote'].split(":")[0]
+
+                def find_crypt_upstream(crypt_remote):
+                    crypt_remote_upstream = rclone_remotes[crypt_remote]['remote'].split(":")[0]
+                    try:
+                        crypt_upstream_remote_type = rclone_remotes[crypt_remote_upstream]['type']
+                        if crypt_upstream_remote_type == "drive":
+                            return [crypt_remote_upstream]
+                        elif crypt_upstream_remote_type == "union":
+                            return find_union_upstreams(crypt_remote_upstream)
+                        elif crypt_upstream_remote_type == "chunker":
+                            return find_chunker_upstream(crypt_remote_upstream)
+                        else:
+                            log.warning(f'{crypt_remote_upstream} is an unsupported type: {rclone_remotes[crypt_remote_upstream]["type"]}.')
+                            return []
+                    except KeyError:
+                        log.error(f'Upstream remote {crypt_remote_upstream} does not exist in rclone.')
+                        exit(1)
+
+                def find_chunker_upstream(chunker_remote):
+                    chunker_remote_upstream = rclone_remotes[chunker_remote]['remote'].split(":")[0]
+                    try:
+                        chunker_upstream_remote_type = rclone_remotes[chunker_remote_upstream]['type']
+                        if chunker_upstream_remote_type == "drive":
+                            return [chunker_remote_upstream]
+                        elif chunker_upstream_remote_type == "union":
+                            return find_union_upstreams(chunker_remote_upstream)
+                        elif chunker_upstream_remote_type == "crypt":
+                            return find_crypt_upstream(chunker_remote_upstream)
+                        else:
+                            log.warning(f'{chunker_remote_upstream} is an unsupported type: {rclone_remotes[chunker_remote_upstream]["type"]}.')
+                            return []
+                    except KeyError:
+                        log.error(f'Upstream remote {chunker_remote_upstream} does not exist in rclone.')
+                        exit(1)
+
+                def find_union_upstreams(union_remote):
+                    union_parsed_upstream = []
+                    for upstream_remote in rclone_remotes[union_remote]['upstreams'].split(' '):
+                        remote_string = upstream_remote.split(":")[0]
+                        try:
+                            upstream_remote_type = rclone_remotes[remote_string]['type']
+                            if upstream_remote_type == "drive":
+                                union_parsed_upstream.append(upstream_remote.split(":")[0])
+                            elif upstream_remote_type == "crypt":
+                                union_parsed_upstream.extend(find_crypt_upstream(remote_string))
+                            elif upstream_remote_type == "chunker":
+                                union_parsed_upstream.extend(find_chunker_upstream(remote_string))
+                            else:
+                                log.warning(f'{remote_string} is an unsupported type: {rclone_remotes[remote_string]["type"]}.')
+                        except KeyError:
+                            log.error(f'Upstream remote {remote_string} does not exist in rclone.')
+                            exit(1)
+                    return union_parsed_upstream
+
+                parsed_remotes = []
+                try:
+                    remote_type = rclone_remotes[config_remote]['type']
+                    if remote_type == "crypt":
+                        parsed_remotes.extend(find_crypt_upstream(config_remote))
+                    elif remote_type == "chunker":
+                        parsed_remotes.extend(find_chunker_upstream(config_remote))
+                    elif remote_type == "drive":
+                        parsed_remotes.append(config_remote)
+                    elif remote_type == "union":
+                        parsed_remotes.extend(find_union_upstreams(config_remote))
+                    else:
+                        log.warning(f'{config_remote} has an unsupported type: {rclone_remotes[config_remote]["type"]}.')
+
+                except KeyError:
+                    log.error(f'{config_remote} is an invalid remote.')
+                    exit(1)
+
+                finally:
+                    log.debug(f"Parsed remotes: {parsed_remotes}")
+
+                if parsed_remotes:
+                    for remote in list(dict.fromkeys(parsed_remotes)):
+                        remote_env = f'RCLONE_CONFIG_{remote.upper()}_SERVICE_ACCOUNT_FILE'
+                        subprocess_env[remote_env] = self.service_account
+                    log.debug(subprocess_env)
+                else:
+                    log.warning('No remotes were added to ENV.')
+            
             # Step 1: Get total source size with --fast-list
             cmd = f"{cmd_quote(self.rclone_binary_path)} size --json --fast-list {cmd_quote(self.config['upload_folder'])} --config={cmd_quote(self.rclone_config_path)}"
+            
+            # Add extras to match upload behavior
+            extras = self.__extras2string()
+            if len(extras) > 2:
+                cmd += f' {extras}'
+            
+            # Add excludes to match upload behavior  
+            excludes = self.__excludes2string()
+            if len(excludes) > 2:
+                cmd += f' {excludes}'
+            
             log.debug(f"Getting total source size: {cmd}")
-            total_output = process.popen(cmd)
+            total_output = process.popen(cmd, env=subprocess_env)
             
             if not total_output:
                 log.error("Failed to get total source size")
@@ -139,6 +240,11 @@ class RcloneUploader:
             
             cmd = f"{cmd_quote(self.rclone_binary_path)} check --one-way --combined {cmd_quote(combined_path)} --fast-list {cmd_quote(self.config['upload_folder'])} {cmd_quote(self.config['upload_remote'])} --config={cmd_quote(self.rclone_config_path)}"
             
+            # Add extras to match upload behavior
+            extras = self.__extras2string()
+            if len(extras) > 2:
+                cmd += f' {extras}'
+            
             # Add excludes to match upload behavior
             excludes = self.__excludes2string()
             if len(excludes) > 2:
@@ -148,7 +254,7 @@ class RcloneUploader:
             
             # Run the check command (it may have non-zero exit if differences found, which is expected)
             try:
-                process.popen(cmd)
+                process.popen(cmd, env=subprocess_env)
             except Exception:
                 # Check command returns non-zero when differences are found, this is expected
                 pass
@@ -195,8 +301,19 @@ class RcloneUploader:
                         f.write('\n'.join(pending_files))
                     
                     cmd = f"{cmd_quote(self.rclone_binary_path)} size --files-from-raw {cmd_quote(pending_list_path)} --json --fast-list {cmd_quote(self.config['upload_folder'])} --config={cmd_quote(self.rclone_config_path)}"
+                    
+                    # Add extras to match upload behavior
+                    extras = self.__extras2string()
+                    if len(extras) > 2:
+                        cmd += f' {extras}'
+                    
+                    # Add excludes to match upload behavior
+                    excludes = self.__excludes2string()
+                    if len(excludes) > 2:
+                        cmd += f' {excludes}'
+                    
                     log.debug(f"Getting pending files size: {cmd}")
-                    pending_output = process.popen(cmd)
+                    pending_output = process.popen(cmd, env=subprocess_env)
                     
                     if pending_output:
                         pending_info = json.loads(pending_output)

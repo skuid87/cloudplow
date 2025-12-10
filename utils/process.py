@@ -33,10 +33,11 @@ def execute(command, callback=None, env=None, logs=True, shell=False):
     return process.poll() if callback else total_output
 
 
-def popen(command, shell=False):
+def popen(command, shell=False, env=None):
     try:
         return subprocess.check_output(command if shell else shlex.split(command),
-                                       shell=shell).decode().strip()
+                                       shell=shell,
+                                       env=env).decode().strip()
 
     except Exception:
         log.exception("Exception while executing process: ")

@@ -32,18 +32,18 @@ class Uploader:
 
     def upload(self):
         # Determine if this is a weekend run
-        is_weekend = datetime.datetime.now().weekday() in [5, 6]
+        self.is_weekend = datetime.datetime.now().weekday() in [5, 6]
         self.transferred_files = set()
         rclone_config = self.rclone_config.copy()
 
         # Load cache and apply excludes on weekdays
-        if not is_weekend and self.transfer_cache is not None:
+        if not self.is_weekend and self.transfer_cache is not None:
             cached_files = self._load_cached_files()
             if cached_files:
                 log.info(f"Weekday run - excluding {len(cached_files)} cached files from transfer")
                 for cached_file in cached_files:
                     rclone_config['rclone_excludes'].append(cached_file)
-        elif is_weekend:
+        elif self.is_weekend:
             log.info("Weekend run - performing full transfer without cache excludes")
         
         # should we exclude open files
@@ -93,7 +93,7 @@ class Uploader:
 
         # Update cache after successful transfer
         if success and self.transferred_files and self.transfer_cache is not None:
-            if is_weekend:
+            if self.is_weekend:
                 self._update_cache_full(self.transferred_files)
             else:
                 self._update_cache_incremental(self.transferred_files)
@@ -128,6 +128,14 @@ class Uploader:
             if file_path:
                 self.transferred_files.add(file_path)
                 log.debug(f"Captured successful transfer: {file_path}")
+                
+                # Periodic cache update every 50 files
+                if len(self.transferred_files) % 50 == 0 and self.transfer_cache is not None:
+                    if self.is_weekend:
+                        self._update_cache_full(self.transferred_files)
+                    else:
+                        self._update_cache_incremental(self.transferred_files)
+                    log.info(f"Periodic cache update: {len(self.transferred_files)} files saved")
         
         # loop sleep triggers
         for trigger_text, trigger_config in self.rclone_config['rclone_sleeps'].items():

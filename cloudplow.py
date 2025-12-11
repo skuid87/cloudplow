@@ -81,6 +81,7 @@ uploader_delay = cache.get_cache('uploader_bans')
 syncer_delay = cache.get_cache('syncer_bans')
 plex_monitor_thread = None
 sa_delay = cache.get_cache('sa_bans')
+transferred_files_cache = cache.get_cache('transferred_files')
 
 
 ############################################################
@@ -268,31 +269,18 @@ def do_upload(remote=None):
                 # retrieve rclone config for this remote
                 rclone_config = conf.configs['remotes'][uploader_remote]
 
-                # create uploader early to check pending files for notification
+                # create uploader with transfer cache
                 uploader = Uploader(uploader_remote,
                                     uploader_config,
                                     rclone_config,
                                     conf.configs['core']['rclone_binary_path'],
                                     conf.configs['core']['rclone_config_path'],
                                     conf.configs['plex'],
-                                    conf.configs['core']['dry_run'])
+                                    conf.configs['core']['dry_run'],
+                                    transferred_files_cache)
 
-                # get pending file information for notification
-                pending_info = uploader.get_pending_info()
-                
-                # send notification that upload is starting with pending file info
-                if pending_info:
-                    notify.send(message=f"Upload starting for {uploader_remote}: "
-                                f"{pending_info['pending_size_gb']} GB pending "
-                                f"({pending_info['pending_count']} files - "
-                                f"{pending_info['missing_count']} new, "
-                                f"{pending_info['modified_count']} modified), "
-                                f"{pending_info['synced_size_gb']} GB already synced "
-                                f"({pending_info['percent_complete']}% complete)")
-                else:
-                    # Fallback to old notification if check failed
-                    total_size_gb = path.get_size(rclone_config['upload_folder'], uploader_config['size_excludes'])
-                    notify.send(message=f"Upload of {total_size_gb} GB has begun for remote: {uploader_remote}")
+                # send notification that upload is starting
+                notify.send(message=f"Upload starting for {uploader_remote}")
 
                 # start the plex stream monitor before the upload begins, if enabled for both plex and the uploader
                 if conf.configs['plex']['enabled'] and plex_monitor_thread is None:
@@ -347,7 +335,7 @@ def do_upload(remote=None):
                     else:
                         for i in range(available_accounts_size):
                             uploader.set_service_account(available_accounts[i])
-                            resp_delay, resp_trigger, resp_success, pending_info = uploader.upload()
+                            resp_delay, resp_trigger, resp_success, transfer_count = uploader.upload()
                             if resp_delay:
                                 current_data = sa_delay[uploader_remote]
                                 current_data[available_accounts[i]] = time.time() + ((60 * 60) * resp_delay)
@@ -379,11 +367,11 @@ def do_upload(remote=None):
                             else:
                                 if resp_success:
                                     log.info(f"Upload completed successfully for uploader: {uploader_remote}")
-                                    # send successful upload notification with pending info
-                                    if pending_info:
-                                        notify.send(message=f"Upload completed for {uploader_remote}. Synced: {pending_info['synced_size_gb']} GB ({pending_info['synced_count']} files, {pending_info['percent_complete']}% complete). Pending: {pending_info['pending_size_gb']} GB ({pending_info['pending_count']} files - {pending_info['missing_count']} new, {pending_info['modified_count']} modified)")
+                                    # send successful upload notification with transfer count
+                                    if transfer_count > 0:
+                                        notify.send(message=f"Upload completed for {uploader_remote}: {transfer_count} files transferred")
                                     else:
-                                        notify.send(message=f"Upload was completed successfully for remote: {uploader_remote}")
+                                        notify.send(message=f"Upload completed for {uploader_remote}: no new files to transfer")
                                 else:
                                     log.info(f"Upload not completed successfully for uploader: {uploader_remote}")
                                     # send unsuccessful upload notification
@@ -393,7 +381,7 @@ def do_upload(remote=None):
                                 sa_delay[uploader_remote][available_accounts[i]] = None
                                 break
                 else:
-                    resp_delay, resp_trigger, resp_success, pending_info = uploader.upload()
+                    resp_delay, resp_trigger, resp_success, transfer_count = uploader.upload()
                     if resp_delay:
                         if uploader_remote not in uploader_delay:
                             # this uploader was not already in the delay dict, so lets put it there
@@ -410,11 +398,11 @@ def do_upload(remote=None):
                     else:
                         if resp_success:
                             log.info(f"Upload completed successfully for uploader: {uploader_remote}")
-                            # send successful upload notification with pending info
-                            if pending_info:
-                                notify.send(message=f"Upload completed for {uploader_remote}. Synced: {pending_info['synced_size_gb']} GB ({pending_info['synced_count']} files, {pending_info['percent_complete']}% complete). Pending: {pending_info['pending_size_gb']} GB ({pending_info['pending_count']} files - {pending_info['missing_count']} new, {pending_info['modified_count']} modified)")
+                            # send successful upload notification with transfer count
+                            if transfer_count > 0:
+                                notify.send(message=f"Upload completed for {uploader_remote}: {transfer_count} files transferred")
                             else:
-                                notify.send(message=f"Upload was completed successfully for remote: {uploader_remote}")
+                                notify.send(message=f"Upload completed for {uploader_remote}: no new files to transfer")
                         else:
                             log.info(f"Upload not completed successfully for uploader: {uploader_remote}")
                             # send unsuccessful upload notification

@@ -1,6 +1,8 @@
 import logging
 import glob
 import time
+import datetime
+import re
 
 from . import path
 from .rclone import RcloneUploader
@@ -9,7 +11,7 @@ log = logging.getLogger("uploader")
 
 
 class Uploader:
-    def __init__(self, name, uploader_config, rclone_config, rclone_binary_path, rclone_config_path, plex, dry_run):
+    def __init__(self, name, uploader_config, rclone_config, rclone_binary_path, rclone_config_path, plex, dry_run, transfer_cache=None):
         self.name = name
         self.uploader_config = uploader_config
         self.rclone_config = rclone_config
@@ -21,38 +23,29 @@ class Uploader:
         self.plex = plex
         self.dry_run = dry_run
         self.service_account = None
+        self.transfer_cache = transfer_cache
+        self.transferred_files = set()
 
     def set_service_account(self, sa_file):
         self.service_account = sa_file
         log.info(f"Using service account: {sa_file}")
 
-    def get_pending_info(self):
-        """Get pending file information without starting upload."""
-        rclone_config = self.rclone_config.copy()
-
-        # should we exclude open files
-        if self.uploader_config['exclude_open_files']:
-            files_to_exclude = self.__opened_files()
-            if len(files_to_exclude):
-                log.info(f"Excluding these files from pending check because they were open: {files_to_exclude}")
-                # add files_to_exclude to rclone_config
-                for item in files_to_exclude:
-                    rclone_config['rclone_excludes'].append(glob.escape(item))
-
-        # create rclone uploader
-        if self.service_account is not None:
-            rclone = RcloneUploader(self.name, rclone_config, self.rclone_binary_path, self.rclone_config_path,
-                                    self.plex, self.dry_run, self.service_account)
-        else:
-            rclone = RcloneUploader(self.name, rclone_config, self.rclone_binary_path, self.rclone_config_path,
-                                    self.plex, self.dry_run)
-
-        # check pending files
-        return rclone.check_pending_files()
-
     def upload(self):
+        # Determine if this is a weekend run
+        is_weekend = datetime.datetime.now().weekday() in [5, 6]
+        self.transferred_files = set()
         rclone_config = self.rclone_config.copy()
 
+        # Load cache and apply excludes on weekdays
+        if not is_weekend and self.transfer_cache is not None:
+            cached_files = self._load_cached_files()
+            if cached_files:
+                log.info(f"Weekday run - excluding {len(cached_files)} cached files from transfer")
+                for cached_file in cached_files:
+                    rclone_config['rclone_excludes'].append(cached_file)
+        elif is_weekend:
+            log.info("Weekend run - performing full transfer without cache excludes")
+        
         # should we exclude open files
         if self.uploader_config['exclude_open_files']:
             files_to_exclude = self.__opened_files()
@@ -69,13 +62,6 @@ class Uploader:
         else:
             rclone = RcloneUploader(self.name, rclone_config, self.rclone_binary_path, self.rclone_config_path,
                                     self.plex, self.dry_run)
-
-        # check pending files before upload
-        pending_info = rclone.check_pending_files()
-        if pending_info:
-            log.info(f"Files pending: {pending_info['pending_count']} ({pending_info['pending_size_gb']} GB), "
-                     f"Already synced: {pending_info['synced_count']} ({pending_info['synced_size_gb']} GB), "
-                     f"Progress: {pending_info['percent_complete']}%")
 
         log.info(f"Uploading '{rclone_config['upload_folder']}' to remote: {self.name}")
         self.delayed_check = 0
@@ -105,7 +91,15 @@ class Uploader:
         else:
             self.delayed_trigger = f"Unhandled situation: Exit code: {return_code} - Upload Status: {upload_status}"
 
-        return self.delayed_check, self.delayed_trigger, success, pending_info
+        # Update cache after successful transfer
+        if success and self.transferred_files and self.transfer_cache is not None:
+            if is_weekend:
+                self._update_cache_full(self.transferred_files)
+            else:
+                self._update_cache_incremental(self.transferred_files)
+            log.info(f"Transferred {len(self.transferred_files)} files")
+
+        return self.delayed_check, self.delayed_trigger, success, len(self.transferred_files)
 
     def remove_empty_dirs(self):
         path.remove_empty_dirs(self.rclone_config['upload_folder'], self.rclone_config['remove_empty_dir_depth'])
@@ -128,6 +122,13 @@ class Uploader:
         )
 
     def __logic(self, data):
+        # Capture successful transfers from rclone output
+        if ': Copied (' in data:
+            file_path = self._extract_filepath_from_rclone_output(data)
+            if file_path:
+                self.transferred_files.add(file_path)
+                log.debug(f"Captured successful transfer: {file_path}")
+        
         # loop sleep triggers
         for trigger_text, trigger_config in self.rclone_config['rclone_sleeps'].items():
             # check/reset trigger timeout
@@ -158,3 +159,84 @@ class Uploader:
                         self.delayed_trigger = trigger_text
                         return True
         return False
+
+    # Cache management methods
+    def _get_current_config(self):
+        """Get current configuration for cache validation"""
+        return {
+            'upload_remote': self.rclone_config['upload_remote'],
+            'upload_folder': self.rclone_config['upload_folder'],
+            'uploader_name': self.name
+        }
+
+    def _load_cached_files(self):
+        """Load cached files for this uploader"""
+        if self.transfer_cache is None:
+            return []
+        
+        cache_data = self.transfer_cache.get(self.name, {})
+        current_config = self._get_current_config()
+        
+        # Check if config matches
+        if cache_data.get('config') != current_config:
+            log.info(f"Cache config mismatch for {self.name} - cache will not be used until next weekend run")
+            return []
+        
+        return cache_data.get('files', [])
+
+    def _update_cache_full(self, transferred_files):
+        """Weekend: Merge newly transferred files with existing cache"""
+        if self.transfer_cache is None:
+            return
+        
+        old_cache = self.transfer_cache.get(self.name, {})
+        current_config = self._get_current_config()
+        
+        # Config changed? Start fresh
+        if old_cache.get('config') != current_config:
+            log.warning(f"Config changed for {self.name} - starting fresh cache")
+            all_files = set(transferred_files)
+        else:
+            # Merge old + new
+            old_files = set(old_cache.get('files', []))
+            new_files = set(transferred_files)
+            all_files = old_files.union(new_files)
+            
+            log.info(f"Cache update for {self.name}: {len(old_files)} previous + {len(new_files)} newly transferred = {len(all_files)} total")
+        
+        self.transfer_cache[self.name] = {
+            'config': current_config,
+            'last_full_run': time.time(),
+            'files': list(all_files)
+        }
+
+    def _update_cache_incremental(self, transferred_files):
+        """Weekday: Add newly transferred files to existing cache"""
+        if self.transfer_cache is None:
+            return
+        
+        old_cache = self.transfer_cache.get(self.name, {})
+        current_config = self._get_current_config()
+        
+        # Config changed? Wait for weekend
+        if old_cache.get('config') != current_config:
+            log.warning(f"Config changed mid-week for {self.name} - cache may be inconsistent until weekend")
+            return
+        
+        old_files = set(old_cache.get('files', []))
+        new_files = set(transferred_files)
+        all_files = old_files.union(new_files)
+        
+        log.info(f"Weekday cache update for {self.name}: added {len(new_files)} files (total: {len(all_files)})")
+        
+        old_cache['files'] = list(all_files)
+        self.transfer_cache[self.name] = old_cache
+
+    def _extract_filepath_from_rclone_output(self, data):
+        """Extract file path from rclone output line"""
+        # Rclone output format: "2024/01/15 10:30:45 INFO  : path/to/file.mkv: Copied (new)"
+        # Pattern to match: anything between "INFO  : " and ": Copied ("
+        match = re.search(r'INFO\s+:\s+(.+?):\s+Copied\s+\(', data)
+        if match:
+            return match.group(1).strip()
+        return None

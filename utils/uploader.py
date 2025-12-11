@@ -226,7 +226,18 @@ class Uploader:
         old_cache = self.transfer_cache.get(self.name, {})
         current_config = self._get_current_config()
         
-        # Config changed? Wait for weekend
+        # Check if cache is empty (first run) or config changed
+        if not old_cache:
+            # First run - initialize cache
+            log.info(f"First cache initialization for {self.name}")
+            self.transfer_cache[self.name] = {
+                'config': current_config,
+                'files': list(transferred_files)
+            }
+            log.info(f"Weekday cache created for {self.name}: {len(transferred_files)} files")
+            return
+        
+        # Config changed mid-week? Wait for weekend
         if old_cache.get('config') != current_config:
             log.warning(f"Config changed mid-week for {self.name} - cache may be inconsistent until weekend")
             return

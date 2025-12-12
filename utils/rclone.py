@@ -31,6 +31,7 @@ class RcloneMover:
         self.dry_run = dry_run
 
     def move(self):
+        exclude_file = None
         try:
             log.debug(f"Moving '{self.config['move_from_remote']}' to '{self.config['move_to_remote']}'")
 
@@ -40,9 +41,17 @@ class RcloneMover:
             extras = self.__extras2string()
             if len(extras) > 2:
                 cmd += f' {extras}'
-            excludes = self.__excludes2string()
-            if len(excludes) > 2:
-                cmd += f' {excludes}'
+            
+            # Use exclude file if there are many excludes (>100) to avoid "Argument list too long" error
+            if 'rclone_excludes' in self.config and len(self.config['rclone_excludes']) > 100:
+                exclude_file = self.__create_exclude_file()
+                cmd += f' --exclude-from={cmd_quote(exclude_file)}'
+                log.info(f"Using exclude file with {len(self.config['rclone_excludes'])} entries")
+            else:
+                excludes = self.__excludes2string()
+                if len(excludes) > 2:
+                    cmd += f' {excludes}'
+            
             if self.plex.get('enabled'):
                 r = re.compile(r"https?://(www\.)?")
                 rc_url = r.sub('', self.plex['rclone']['url']).strip().strip('/')
@@ -57,6 +66,14 @@ class RcloneMover:
 
         except Exception:
             log.exception(f"Exception occurred while moving '{self.config['move_from_remote']}' to '{self.config['move_to_remote']}':")
+        finally:
+            # Clean up exclude file
+            if exclude_file and os.path.exists(exclude_file):
+                try:
+                    os.remove(exclude_file)
+                    log.debug(f"Cleaned up exclude file: {exclude_file}")
+                except Exception as e:
+                    log.warning(f"Failed to clean up exclude file {exclude_file}: {e}")
 
         return False
 
@@ -72,6 +89,45 @@ class RcloneMover:
             return ''
 
         return ' '.join(f"--exclude={cmd_quote(glob.escape(value) if value.startswith(os.path.sep) else value) if isinstance(value,str) else value}" for value in self.config['rclone_excludes']).replace('=None', '').strip()
+
+    def __create_exclude_file(self):
+        """Create a temporary file with exclude patterns for rclone --exclude-from"""
+        # Store temp file in same directory as rclone config (typically /opt/cloudplow)
+        # This ensures Docker compatibility and proper permissions
+        try:
+            config_dir = os.path.dirname(self.rclone_config_path)
+            
+            # Ensure directory exists and is writable
+            if os.path.isdir(config_dir) and os.access(config_dir, os.W_OK):
+                temp_dir = config_dir
+            else:
+                # Fall back to system temp directory
+                temp_dir = tempfile.gettempdir()
+                log.warning(f"Config directory {config_dir} not writable, using {temp_dir} for exclude file")
+        except Exception:
+            # If anything fails, use system temp
+            temp_dir = tempfile.gettempdir()
+            log.warning(f"Could not determine config directory, using {temp_dir} for exclude file")
+        
+        fd, exclude_file_path = tempfile.mkstemp(
+            prefix='cloudplow_exclude_', 
+            suffix='.txt',
+            dir=temp_dir
+        )
+        
+        try:
+            with os.fdopen(fd, 'w') as f:
+                for value in self.config['rclone_excludes']:
+                    if isinstance(value, str):
+                        # Process the same way as __excludes2string
+                        exclude_value = glob.escape(value) if value.startswith(os.path.sep) else value
+                        f.write(f"{exclude_value}\n")
+        except Exception:
+            os.close(fd)
+            raise
+        
+        log.debug(f"Created exclude file at: {exclude_file_path}")
+        return exclude_file_path
 
 
 class RcloneUploader:
@@ -115,6 +171,7 @@ class RcloneUploader:
         return False
 
     def upload(self, callback):
+        exclude_file = None
         try:
             log.debug(f"Uploading '{self.config['upload_folder']}' to '{self.config['upload_remote']}'")
             log.debug(f"Rclone command set to '{self.config['rclone_command'] if ('rclone_command' in self.config and self.config['rclone_command'].lower() != 'sync') else 'move'}'")
@@ -213,9 +270,17 @@ class RcloneUploader:
             extras = self.__extras2string()
             if len(extras) > 2:
                 cmd += f' {extras}'
-            excludes = self.__excludes2string()
-            if len(excludes) > 2:
-                cmd += f' {excludes}'
+            
+            # Use exclude file if there are many excludes (>100) to avoid "Argument list too long" error
+            if 'rclone_excludes' in self.config and len(self.config['rclone_excludes']) > 100:
+                exclude_file = self.__create_exclude_file()
+                cmd += f' --exclude-from={cmd_quote(exclude_file)}'
+                log.info(f"Using exclude file with {len(self.config['rclone_excludes'])} entries")
+            else:
+                excludes = self.__excludes2string()
+                if len(excludes) > 2:
+                    cmd += f' {excludes}'
+            
             if self.plex.get('enabled'):
                 r = re.compile(r"https?://(www\.)?")
                 rc_url = r.sub('', self.plex['rclone']['url']).strip().strip('/')
@@ -231,6 +296,14 @@ class RcloneUploader:
             log.exception("Exception occurred while uploading '%s' to remote: %s", self.config['upload_folder'],
                           self.name)
             return_code = 9999
+        finally:
+            # Clean up exclude file
+            if exclude_file and os.path.exists(exclude_file):
+                try:
+                    os.remove(exclude_file)
+                    log.debug(f"Cleaned up exclude file: {exclude_file}")
+                except Exception as e:
+                    log.warning(f"Failed to clean up exclude file {exclude_file}: {e}")
 
         return False, return_code
 
@@ -246,6 +319,45 @@ class RcloneUploader:
                                                                                                         str) else value)
             for value in
             self.config['rclone_excludes']).replace('=None', '').strip()
+
+    def __create_exclude_file(self):
+        """Create a temporary file with exclude patterns for rclone --exclude-from"""
+        # Store temp file in same directory as rclone config (typically /opt/cloudplow)
+        # This ensures Docker compatibility and proper permissions
+        try:
+            config_dir = os.path.dirname(self.rclone_config_path)
+            
+            # Ensure directory exists and is writable
+            if os.path.isdir(config_dir) and os.access(config_dir, os.W_OK):
+                temp_dir = config_dir
+            else:
+                # Fall back to system temp directory
+                temp_dir = tempfile.gettempdir()
+                log.warning(f"Config directory {config_dir} not writable, using {temp_dir} for exclude file")
+        except Exception:
+            # If anything fails, use system temp
+            temp_dir = tempfile.gettempdir()
+            log.warning(f"Could not determine config directory, using {temp_dir} for exclude file")
+        
+        fd, exclude_file_path = tempfile.mkstemp(
+            prefix='cloudplow_exclude_', 
+            suffix='.txt',
+            dir=temp_dir
+        )
+        
+        try:
+            with os.fdopen(fd, 'w') as f:
+                for value in self.config['rclone_excludes']:
+                    if isinstance(value, str):
+                        # Process the same way as __excludes2string
+                        exclude_value = glob.escape(value) if value.startswith(os.path.sep) else value
+                        f.write(f"{exclude_value}\n")
+        except Exception:
+            os.close(fd)
+            raise
+        
+        log.debug(f"Created exclude file at: {exclude_file_path}")
+        return exclude_file_path
 
 
 class RcloneSyncer:

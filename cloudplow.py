@@ -88,6 +88,33 @@ transferred_files_cache = cache.get_cache('transferred_files')
 # MISC FUNCS
 ############################################################
 
+def cleanup_temp_exclude_files():
+    """Clean up any orphaned exclude files from previous runs"""
+    try:
+        # Get the directory where rclone config is stored
+        rclone_config_path = conf.configs['core']['rclone_config_path']
+        config_dir = os.path.dirname(rclone_config_path)
+        
+        if not os.path.isdir(config_dir):
+            return
+        
+        # Find all cloudplow exclude temp files
+        import glob
+        pattern = os.path.join(config_dir, 'cloudplow_exclude_*.txt')
+        orphaned_files = glob.glob(pattern)
+        
+        if orphaned_files:
+            log.info(f"Cleaning up {len(orphaned_files)} orphaned exclude file(s) from previous runs")
+            for file_path in orphaned_files:
+                try:
+                    os.remove(file_path)
+                    log.debug(f"Removed orphaned exclude file: {file_path}")
+                except Exception as e:
+                    log.warning(f"Failed to remove orphaned exclude file {file_path}: {e}")
+    except Exception:
+        log.exception("Exception during temp file cleanup: ")
+
+
 def init_notifications():
     try:
         for notification_name, notification_config in conf.configs['notifications'].items():
@@ -767,6 +794,9 @@ def scheduled_syncer(syncer_name):
 if __name__ == "__main__":
     # show the latest version info from git
     version.check_version()
+
+    # cleanup orphaned temp files from previous runs
+    cleanup_temp_exclude_files()
 
     # run chosen mode
     try:

@@ -378,7 +378,7 @@ def do_upload(remote=None):
                                     # to sleep this remote for
                                     # Before banning remote, check that a service account did not become unbanned
                                     # during upload
-                                    check_suspended_sa(sa_delay[uploader_remote])
+                                    check_suspended_sa(uploader_remote)
 
                                     unban_time = misc.get_lowest_remaining_time(sa_delay[uploader_remote])
                                     if unban_time is not None:

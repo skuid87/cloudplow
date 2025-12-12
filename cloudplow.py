@@ -357,7 +357,7 @@ def do_upload(remote=None):
                         log.info(f"Upload aborted due to the fact that no service accounts are currently unbanned and available to use for remote {uploader_remote}")
                         # add remote to uploader_delay
                         time_till_unban = misc.get_lowest_remaining_time(sa_delay[uploader_remote])
-                        log.info(f"Lowest Remaining time till unban is {time_till_unban}")
+                        log.info(f"Lowest Remaining time till unban is {misc.seconds_to_string(int(time_till_unban - time.time()))}")
                         uploader_delay[uploader_remote] = time_till_unban
                     else:
                         for i in range(available_accounts_size):

@@ -299,6 +299,14 @@ def do_upload(remote=None):
                 # retrieve rclone config for this remote
                 rclone_config = conf.configs['remotes'][uploader_remote]
 
+                # determine RC URL for stats polling
+                rc_url = None
+                if conf.configs['plex'].get('enabled') and 'rclone' in conf.configs['plex']:
+                    rc_url = conf.configs['plex']['rclone'].get('url')
+                if not rc_url:
+                    # Default RC URL if not configured via Plex
+                    rc_url = 'http://localhost:5572'
+
                 # create uploader with transfer cache
                 uploader = Uploader(uploader_remote,
                                     uploader_config,
@@ -308,7 +316,8 @@ def do_upload(remote=None):
                                     conf.configs['plex'],
                                     conf.configs['core']['dry_run'],
                                     transferred_files_cache,
-                                    json_transfer_log)
+                                    json_transfer_log,
+                                    rc_url)
 
                 # send notification that upload is starting
                 notify.send(message=f"Upload starting for {uploader_remote}")

@@ -4,6 +4,9 @@ import time
 import datetime
 import re
 import json
+import threading
+import requests
+from logging.handlers import RotatingFileHandler
 
 from . import path
 from .rclone import RcloneUploader
@@ -11,8 +14,111 @@ from .rclone import RcloneUploader
 log = logging.getLogger("uploader")
 
 
+# Helper functions for formatting
+def format_bytes(bytes_val):
+    """Convert bytes to human readable format"""
+    if bytes_val == 0:
+        return "0 B"
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
+        if bytes_val < 1024.0:
+            return f"{bytes_val:.1f} {unit}"
+        bytes_val /= 1024.0
+    return f"{bytes_val:.1f} PB"
+
+
+def format_duration(seconds):
+    """Convert seconds to human readable format"""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        return f"{hours}h {minutes}m"
+
+
+class RCStatsPoller(threading.Thread):
+    """Background thread that polls rclone RC API for transfer stats"""
+    
+    def __init__(self, rc_url):
+        super().__init__(daemon=True)
+        self.rc_url = rc_url
+        self.running = False
+        self.current_stats = {}
+        self.poll_interval = 5  # Start with 5 seconds
+        self._lock = threading.Lock()
+    
+    def run(self):
+        """Poll RC API in background"""
+        self.running = True
+        log.info(f"Started RC stats polling at {self.rc_url}")
+        
+        while self.running:
+            try:
+                # Poll the RC API
+                response = requests.post(
+                    f"{self.rc_url}/core/stats",
+                    timeout=5
+                )
+                
+                if response.status_code == 200:
+                    stats = response.json()
+                    
+                    with self._lock:
+                        self.current_stats = stats
+                    
+                    # Calculate next poll interval based on current transfers
+                    self.poll_interval = self._calculate_poll_interval(stats)
+                    
+            except Exception as e:
+                log.debug(f"RC stats poll error: {e}")
+                self.poll_interval = 10  # Back off on errors
+            
+            # Sleep with check for stop signal
+            for _ in range(int(self.poll_interval * 10)):
+                if not self.running:
+                    break
+                time.sleep(0.1)
+        
+        log.info("Stopped RC stats polling")
+    
+    def _calculate_poll_interval(self, stats):
+        """Calculate optimal polling interval based on current transfers"""
+        if not stats or 'transferring' not in stats:
+            return 10
+        
+        transferring = stats['transferring']
+        
+        if not transferring:
+            return 10  # No active transfers, slow poll
+        
+        # Look at ETAs of current transfers
+        min_eta = min((t.get('eta', 999) for t in transferring), default=999)
+        
+        if min_eta < 15:
+            return 2  # Fast completing file, poll aggressively
+        elif min_eta < 60:
+            return 5  # Medium file, poll frequently
+        elif min_eta < 180:
+            return 8  # Larger file, moderate polling
+        else:
+            return 10  # Very large file, slower polling
+    
+    def get_stats(self):
+        """Get current RC stats (thread-safe)"""
+        with self._lock:
+            return self.current_stats.copy() if self.current_stats else {}
+    
+    def stop(self):
+        """Stop the polling thread"""
+        self.running = False
+
+
 class Uploader:
-    def __init__(self, name, uploader_config, rclone_config, rclone_binary_path, rclone_config_path, plex, dry_run, transfer_cache=None, json_log_path=None):
+    def __init__(self, name, uploader_config, rclone_config, rclone_binary_path, rclone_config_path, plex, dry_run, transfer_cache=None, json_log_path=None, rc_url=None):
         self.name = name
         self.uploader_config = uploader_config
         self.rclone_config = rclone_config
@@ -27,10 +133,69 @@ class Uploader:
         self.transfer_cache = transfer_cache
         self.transferred_files = set()
         self.json_log_path = json_log_path
+        self.rc_url = rc_url
+        self.rc_poller = None
+        self.json_logger = None
+        
+        # Initialize JSONL logger with rotation if path provided
+        if self.json_log_path:
+            self._init_json_logger()
 
     def set_service_account(self, sa_file):
         self.service_account = sa_file
         log.info(f"Using service account: {sa_file}")
+    
+    def _init_json_logger(self):
+        """Initialize JSONL logger with rotation"""
+        try:
+            # Create a custom logger that just writes JSON lines
+            # We'll handle writes manually to control format
+            self.json_logger = RotatingFileHandler(
+                self.json_log_path,
+                maxBytes=1024 * 1024 * 5,  # 5 MB
+                backupCount=50,
+                encoding='utf-8'
+            )
+            log.info(f"Initialized JSONL logger at: {self.json_log_path}")
+        except Exception as e:
+            log.error(f"Failed to initialize JSONL logger: {e}")
+            self.json_logger = None
+    
+    def _write_json_log(self, entry):
+        """Write a JSON entry to the log file with rotation"""
+        if not self.json_logger:
+            return
+        
+        try:
+            # Manually trigger rotation check
+            if self.json_logger.shouldRollover(None):
+                self.json_logger.doRollover()
+            
+            # Write JSON line
+            with open(self.json_logger.baseFilename, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(entry) + '\n')
+        except Exception as e:
+            log.warning(f"Failed to write to JSONL log: {e}")
+    
+    def _start_rc_polling(self):
+        """Start RC stats polling thread"""
+        if self.rc_url and not self.rc_poller:
+            try:
+                self.rc_poller = RCStatsPoller(self.rc_url)
+                self.rc_poller.start()
+            except Exception as e:
+                log.warning(f"Failed to start RC polling: {e}")
+                self.rc_poller = None
+    
+    def _stop_rc_polling(self):
+        """Stop RC stats polling thread"""
+        if self.rc_poller:
+            try:
+                self.rc_poller.stop()
+                self.rc_poller.join(timeout=5)
+                self.rc_poller = None
+            except Exception as e:
+                log.warning(f"Error stopping RC polling: {e}")
 
     def upload(self):
         # Determine if this is a weekend run
@@ -57,51 +222,59 @@ class Uploader:
                 for item in files_to_exclude:
                     rclone_config['rclone_excludes'].append(glob.escape(item))
 
-        # do upload
-        if self.service_account is not None:
-            rclone = RcloneUploader(self.name, rclone_config, self.rclone_binary_path, self.rclone_config_path,
-                                    self.plex, self.dry_run, self.service_account)
-        else:
-            rclone = RcloneUploader(self.name, rclone_config, self.rclone_binary_path, self.rclone_config_path,
-                                    self.plex, self.dry_run)
-
-        log.info(f"Uploading '{rclone_config['upload_folder']}' to remote: {self.name}")
-        self.delayed_check = 0
-        self.trigger_tracks = {}
-        success = False
-        upload_status, return_code = rclone.upload(self.__logic)
-
-        log.debug("return_code is: %s", return_code)
-
-        if return_code == 7:
-            success = True
-            log.info("Received 'Max Transfer Reached' signal from Rclone.")
-            self.delayed_trigger = "Rclone's 'Max Transfer Reached' signal"
-            self.delayed_check = 25
-
-        elif return_code == -9:
-            success = True
-            log.info("Trigger reached configuration limit.")
-            self.delayed_trigger = "Trigger reached limit"
-            self.delayed_check = 25
-
-        elif upload_status and return_code == 0:
-            success = True
-            log.info(f"Finished uploading to remote: {self.name}")
-        elif return_code == 9999:
-            self.delayed_trigger = "Rclone exception occured"
-        else:
-            self.delayed_trigger = f"Unhandled situation: Exit code: {return_code} - Upload Status: {upload_status}"
-
-        # Update cache after successful transfer
-        if success and self.transferred_files and self.transfer_cache is not None:
-            if self.is_weekend:
-                self._update_cache_full(self.transferred_files)
+        # Start RC stats polling if configured
+        self._start_rc_polling()
+        
+        try:
+            # do upload
+            if self.service_account is not None:
+                rclone = RcloneUploader(self.name, rclone_config, self.rclone_binary_path, self.rclone_config_path,
+                                        self.plex, self.dry_run, self.service_account)
             else:
-                self._update_cache_incremental(self.transferred_files)
-            log.info(f"Transferred {len(self.transferred_files)} files")
+                rclone = RcloneUploader(self.name, rclone_config, self.rclone_binary_path, self.rclone_config_path,
+                                        self.plex, self.dry_run)
 
-        return self.delayed_check, self.delayed_trigger, success, len(self.transferred_files)
+            log.info(f"Uploading '{rclone_config['upload_folder']}' to remote: {self.name}")
+            self.delayed_check = 0
+            self.trigger_tracks = {}
+            success = False
+            upload_status, return_code = rclone.upload(self.__logic)
+
+            log.debug("return_code is: %s", return_code)
+
+            if return_code == 7:
+                success = True
+                log.info("Received 'Max Transfer Reached' signal from Rclone.")
+                self.delayed_trigger = "Rclone's 'Max Transfer Reached' signal"
+                self.delayed_check = 25
+
+            elif return_code == -9:
+                success = True
+                log.info("Trigger reached configuration limit.")
+                self.delayed_trigger = "Trigger reached limit"
+                self.delayed_check = 25
+
+            elif upload_status and return_code == 0:
+                success = True
+                log.info(f"Finished uploading to remote: {self.name}")
+            elif return_code == 9999:
+                self.delayed_trigger = "Rclone exception occured"
+            else:
+                self.delayed_trigger = f"Unhandled situation: Exit code: {return_code} - Upload Status: {upload_status}"
+
+            # Update cache after successful transfer
+            if success and self.transferred_files and self.transfer_cache is not None:
+                if self.is_weekend:
+                    self._update_cache_full(self.transferred_files)
+                else:
+                    self._update_cache_incremental(self.transferred_files)
+                log.info(f"Transferred {len(self.transferred_files)} files")
+
+            return self.delayed_check, self.delayed_trigger, success, len(self.transferred_files)
+        
+        finally:
+            # Always stop RC polling when upload completes
+            self._stop_rc_polling()
 
     def remove_empty_dirs(self):
         path.remove_empty_dirs(self.rclone_config['upload_folder'], self.rclone_config['remove_empty_dir_depth'])
@@ -124,22 +297,15 @@ class Uploader:
         )
 
     def __logic(self, data):
-        # Detect and handle JSON stats output
-        if data.strip().startswith('{') and self.json_log_path:
-            try:
-                stats = json.loads(data)
-                self._log_json_stats(stats)
-                self._process_json_stats(stats)
-                # Don't return here, continue to check triggers below
-            except json.JSONDecodeError:
-                pass  # Not valid JSON, continue with text parsing
-        
         # Capture successful transfers from rclone output
         if ': Copied (' in data:
             file_path = self._extract_filepath_from_rclone_output(data)
             if file_path:
                 self.transferred_files.add(file_path)
                 log.debug(f"Captured successful transfer: {file_path}")
+                
+                # Log to JSONL with RC stats enrichment
+                self._log_completed_file(file_path)
                 
                 # Periodic cache update every 50 files
                 if len(self.transferred_files) % 50 == 0 and self.transfer_cache is not None:
@@ -271,49 +437,62 @@ class Uploader:
         if match:
             return match.group(1).strip()
         return None
-
-    def _log_json_stats(self, stats):
-        """Write JSON stats to separate log file in JSON Lines format"""
+    
+    def _log_completed_file(self, file_path):
+        """Log completed file to JSONL with RC stats enrichment"""
+        if not self.json_logger:
+            return
+        
         try:
-            # Add timestamp and uploader name for context
-            log_entry = {
+            # Get current RC stats
+            rc_stats = self.rc_poller.get_stats() if self.rc_poller else {}
+            
+            # Build base entry
+            entry = {
                 'timestamp': time.time(),
                 'datetime': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'uploader': self.name,
-                'stats': stats
+                'filename': file_path,
             }
             
-            with open(self.json_log_path, 'a') as f:
-                f.write(json.dumps(log_entry) + '\n')
-        except Exception as e:
-            log.warning(f"Failed to write JSON stats to {self.json_log_path}: {e}")
-
-    def _process_json_stats(self, stats):
-        """Process JSON stats and log human-readable summaries"""
-        try:
-            # Log actively transferring files
-            if 'transferring' in stats and stats['transferring']:
-                for transfer in stats['transferring']:
-                    file_name = transfer.get('name', 'unknown')
-                    file_size_mb = transfer.get('size', 0) / 1024 / 1024
-                    speed_mbps = transfer.get('speed', 0) / 1024 / 1024
-                    percentage = transfer.get('percentage', 0)
-                    
-                    log.info(f"[TRANSFER] {file_name} ({file_size_mb:.1f} MB) - {percentage:.0f}% @ {speed_mbps:.2f} MB/s")
+            # Try to find this file in recent RC transferring data
+            # (it might have been in the last poll before completion)
+            file_stats = self._find_file_in_rc_stats(file_path, rc_stats)
             
-            # Log overall progress
-            if 'bytes' in stats and 'totalBytes' in stats and stats['totalBytes'] > 0:
-                transferred_gb = stats['bytes'] / 1024 / 1024 / 1024
-                total_gb = stats['totalBytes'] / 1024 / 1024 / 1024
-                avg_speed_mbps = stats.get('speed', 0) / 1024 / 1024
-                transfers_done = stats.get('transfers', 0)
-                total_transfers = stats.get('totalTransfers', 0)
-                eta_seconds = stats.get('eta', 0)
+            if file_stats:
+                # Enrich with RC data
+                entry['size_bytes'] = file_stats.get('size', 0)
+                entry['size_human'] = format_bytes(file_stats.get('size', 0))
                 
-                eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s" if eta_seconds else "N/A"
+                avg_speed = file_stats.get('speedAvg', 0)
+                entry['avg_speed_bytes'] = int(avg_speed)
+                entry['avg_speed_human'] = format_bytes(avg_speed) + '/s'
                 
-                log.info(f"[PROGRESS] {transferred_gb:.2f}/{total_gb:.2f} GB | "
-                        f"{transfers_done}/{total_transfers} files | "
-                        f"{avg_speed_mbps:.2f} MB/s | ETA: {eta_str}")
+                # Calculate approximate duration
+                if avg_speed > 0 and file_stats.get('size', 0) > 0:
+                    duration = file_stats['size'] / avg_speed
+                    entry['duration_seconds'] = round(duration, 1)
+                    entry['duration_human'] = format_duration(duration)
+                
+                entry['source'] = file_stats.get('srcFs', '')
+                entry['destination'] = file_stats.get('dstFs', '')
+            
+            # Write to JSONL
+            self._write_json_log(entry)
+            
         except Exception as e:
-            log.debug(f"Error processing JSON stats: {e}")
+            log.debug(f"Error logging completed file to JSONL: {e}")
+    
+    def _find_file_in_rc_stats(self, file_path, rc_stats):
+        """Find file stats in RC data by matching filename"""
+        if not rc_stats or 'transferring' not in rc_stats:
+            return None
+        
+        # Look for exact match in currently transferring files
+        for transfer in rc_stats.get('transferring', []):
+            if transfer.get('name') == file_path:
+                return transfer
+        
+        # File not in current transferring list (already completed)
+        # This is normal - file completed between our last poll and now
+        return None

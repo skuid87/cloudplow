@@ -3,6 +3,7 @@ import glob
 import time
 import datetime
 import re
+import json
 
 from . import path
 from .rclone import RcloneUploader
@@ -11,7 +12,7 @@ log = logging.getLogger("uploader")
 
 
 class Uploader:
-    def __init__(self, name, uploader_config, rclone_config, rclone_binary_path, rclone_config_path, plex, dry_run, transfer_cache=None):
+    def __init__(self, name, uploader_config, rclone_config, rclone_binary_path, rclone_config_path, plex, dry_run, transfer_cache=None, json_log_path=None):
         self.name = name
         self.uploader_config = uploader_config
         self.rclone_config = rclone_config
@@ -25,6 +26,7 @@ class Uploader:
         self.service_account = None
         self.transfer_cache = transfer_cache
         self.transferred_files = set()
+        self.json_log_path = json_log_path
 
     def set_service_account(self, sa_file):
         self.service_account = sa_file
@@ -122,6 +124,16 @@ class Uploader:
         )
 
     def __logic(self, data):
+        # Detect and handle JSON stats output
+        if data.strip().startswith('{') and self.json_log_path:
+            try:
+                stats = json.loads(data)
+                self._log_json_stats(stats)
+                self._process_json_stats(stats)
+                # Don't return here, continue to check triggers below
+            except json.JSONDecodeError:
+                pass  # Not valid JSON, continue with text parsing
+        
         # Capture successful transfers from rclone output
         if ': Copied (' in data:
             file_path = self._extract_filepath_from_rclone_output(data)
@@ -259,3 +271,49 @@ class Uploader:
         if match:
             return match.group(1).strip()
         return None
+
+    def _log_json_stats(self, stats):
+        """Write JSON stats to separate log file in JSON Lines format"""
+        try:
+            # Add timestamp and uploader name for context
+            log_entry = {
+                'timestamp': time.time(),
+                'datetime': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'uploader': self.name,
+                'stats': stats
+            }
+            
+            with open(self.json_log_path, 'a') as f:
+                f.write(json.dumps(log_entry) + '\n')
+        except Exception as e:
+            log.warning(f"Failed to write JSON stats to {self.json_log_path}: {e}")
+
+    def _process_json_stats(self, stats):
+        """Process JSON stats and log human-readable summaries"""
+        try:
+            # Log actively transferring files
+            if 'transferring' in stats and stats['transferring']:
+                for transfer in stats['transferring']:
+                    file_name = transfer.get('name', 'unknown')
+                    file_size_mb = transfer.get('size', 0) / 1024 / 1024
+                    speed_mbps = transfer.get('speed', 0) / 1024 / 1024
+                    percentage = transfer.get('percentage', 0)
+                    
+                    log.info(f"[TRANSFER] {file_name} ({file_size_mb:.1f} MB) - {percentage:.0f}% @ {speed_mbps:.2f} MB/s")
+            
+            # Log overall progress
+            if 'bytes' in stats and 'totalBytes' in stats and stats['totalBytes'] > 0:
+                transferred_gb = stats['bytes'] / 1024 / 1024 / 1024
+                total_gb = stats['totalBytes'] / 1024 / 1024 / 1024
+                avg_speed_mbps = stats.get('speed', 0) / 1024 / 1024
+                transfers_done = stats.get('transfers', 0)
+                total_transfers = stats.get('totalTransfers', 0)
+                eta_seconds = stats.get('eta', 0)
+                
+                eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s" if eta_seconds else "N/A"
+                
+                log.info(f"[PROGRESS] {transferred_gb:.2f}/{total_gb:.2f} GB | "
+                        f"{transfers_done}/{total_transfers} files | "
+                        f"{avg_speed_mbps:.2f} MB/s | ETA: {eta_str}")
+        except Exception as e:
+            log.debug(f"Error processing JSON stats: {e}")

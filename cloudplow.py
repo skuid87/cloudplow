@@ -83,6 +83,9 @@ plex_monitor_thread = None
 sa_delay = cache.get_cache('sa_bans')
 transferred_files_cache = cache.get_cache('transferred_files')
 
+# JSON transfer stats log path
+json_transfer_log = os.path.join(os.path.dirname(conf.settings['logfile']), 'transfer-stats.jsonl')
+
 
 ############################################################
 # MISC FUNCS
@@ -304,7 +307,8 @@ def do_upload(remote=None):
                                     conf.configs['core']['rclone_config_path'],
                                     conf.configs['plex'],
                                     conf.configs['core']['dry_run'],
-                                    transferred_files_cache)
+                                    transferred_files_cache,
+                                    json_transfer_log)
 
                 # send notification that upload is starting
                 notify.send(message=f"Upload starting for {uploader_remote}")

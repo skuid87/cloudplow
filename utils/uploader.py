@@ -6,6 +6,7 @@ import re
 import json
 import threading
 import requests
+import os
 from logging.handlers import RotatingFileHandler
 
 from . import path
@@ -167,9 +168,11 @@ class Uploader:
             return
         
         try:
-            # Manually trigger rotation check
-            if self.json_logger.shouldRollover(None):
-                self.json_logger.doRollover()
+            # Manually check file size for rotation
+            if os.path.exists(self.json_logger.baseFilename):
+                file_size = os.path.getsize(self.json_logger.baseFilename)
+                if file_size >= self.json_logger.maxBytes:
+                    self.json_logger.doRollover()
             
             # Write JSON line
             with open(self.json_logger.baseFilename, 'a', encoding='utf-8') as f:

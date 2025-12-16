@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import datetime
 import logging
 import os
 import sys
@@ -319,6 +320,18 @@ def do_upload(remote=None):
                                     json_transfer_log,
                                     rc_url)
 
+                # Initialize cumulative metrics for this upload session
+                session_start_time = time.time()
+                cumulative_metrics = {
+                    'transfer_count': 0,
+                    'total_bytes': 0,
+                    'duration_seconds': 0,
+                    'start_time': session_start_time,
+                    'sa_used': [],
+                    'cached_files_excluded': 0,
+                    'is_weekend': datetime.datetime.now().weekday() in [5, 6]
+                }
+
                 # send notification that upload is starting
                 notify.send(message=f"Upload starting for {uploader_remote}")
 
@@ -372,10 +385,31 @@ def do_upload(remote=None):
                         time_till_unban = misc.get_lowest_remaining_time(sa_delay[uploader_remote])
                         log.info(f"Lowest Remaining time till unban is {misc.seconds_to_string(int(time_till_unban - time.time()))}")
                         uploader_delay[uploader_remote] = time_till_unban
+                        
+                        # Send notification about no available accounts
+                        notify.send(message=f"Upload skipped for {uploader_remote}: All service accounts are currently suspended. Next available in {misc.seconds_to_string(int(time_till_unban - time.time()))}")
                     else:
+                        # Update start notification with SA info
+                        notify.send(message=f"Upload starting for {uploader_remote} using service account: {available_accounts[0]} ({available_accounts_size} accounts available)")
+                        
                         for i in range(available_accounts_size):
                             uploader.set_service_account(available_accounts[i])
-                            resp_delay, resp_trigger, resp_success, transfer_count = uploader.upload()
+                            sa_start_time = time.time()
+                            
+                            # Upload returns a dict now
+                            resp = uploader.upload()
+                            resp_delay = resp['delayed_check']
+                            resp_trigger = resp['delayed_trigger']
+                            resp_success = resp['success']
+                            transfer_count = resp['transfer_count']
+                            
+                            # Accumulate metrics from this SA's run
+                            cumulative_metrics['transfer_count'] += transfer_count
+                            cumulative_metrics['total_bytes'] += resp['total_bytes']
+                            cumulative_metrics['duration_seconds'] += resp['duration_seconds']
+                            cumulative_metrics['sa_used'].append(available_accounts[i])
+                            if resp['cached_files_excluded'] > 0:
+                                cumulative_metrics['cached_files_excluded'] = resp['cached_files_excluded']
                             if resp_delay:
                                 current_data = sa_delay[uploader_remote]
                                 current_data[available_accounts[i]] = time.time() + ((60 * 60) * resp_delay)
@@ -385,6 +419,17 @@ def do_upload(remote=None):
                                     log.info(f"Upload aborted due to trigger: {resp_trigger} being met, {uploader_remote} is cycling to service_account file: {available_accounts[i + 1]}")
                                     # Set unban time for current service account
                                     log.debug(f"Setting service account {available_accounts[i]} as banned for remote: {uploader_remote}")
+                                    
+                                    # Send SA cycling notification with this SA's stats and cumulative totals
+                                    from utils.uploader import format_bytes, format_duration
+                                    sa_msg = (f"Service account {available_accounts[i]} hit '{resp_trigger}' for {uploader_remote}. "
+                                             f"This SA uploaded: {transfer_count} files ({format_bytes(resp['total_bytes'])}) "
+                                             f"in {format_duration(resp['duration_seconds'])}. "
+                                             f"Session total so far: {cumulative_metrics['transfer_count']} files "
+                                             f"({format_bytes(cumulative_metrics['total_bytes'])}). "
+                                             f"Cycling to {available_accounts[i + 1]} ({available_accounts_size - i - 1} remaining)")
+                                    notify.send(message=sa_msg)
+                                    
                                     continue
                                 else:
                                     # non 0 result indicates a trigger was met, the result is how many hours
@@ -402,51 +447,155 @@ def do_upload(remote=None):
                                         uploader_delay[uploader_remote] = misc.get_lowest_remaining_time(
                                             sa_delay[uploader_remote])
 
-                                        # send aborted upload notification
-                                        notify.send(message=f"Upload was aborted for remote: {uploader_remote} due to trigger {resp_trigger}. Uploads suspended for {resp_delay} hours")
+                                        # send aborted upload notification with cumulative stats
+                                        from utils.uploader import format_bytes, format_duration
+                                        total_duration = time.time() - cumulative_metrics['start_time']
+                                        avg_speed = cumulative_metrics['total_bytes'] / total_duration if total_duration > 0 else 0
+                                        
+                                        abort_msg = (f"Upload was aborted for remote: {uploader_remote} due to trigger {resp_trigger}. "
+                                                    f"Partial upload: {cumulative_metrics['transfer_count']} files "
+                                                    f"({format_bytes(cumulative_metrics['total_bytes'])}) transferred "
+                                                    f"in {format_duration(total_duration)} "
+                                                    f"at avg {format_bytes(avg_speed)}/s. "
+                                                    f"Uploads suspended for {resp_delay} hours")
+                                        notify.send(message=abort_msg)
                             else:
                                 if resp_success:
                                     log.info(f"Upload completed successfully for uploader: {uploader_remote}")
-                                    # send successful upload notification with transfer count
-                                    if transfer_count > 0:
-                                        notify.send(message=f"Upload completed for {uploader_remote}: {transfer_count} files transferred")
+                                    # send successful upload notification with cumulative metrics
+                                    from utils.uploader import format_bytes, format_duration
+                                    
+                                    if cumulative_metrics['transfer_count'] > 0:
+                                        total_duration = time.time() - cumulative_metrics['start_time']
+                                        avg_speed = cumulative_metrics['total_bytes'] / total_duration if total_duration > 0 else 0
+                                        
+                                        # Build SA info string
+                                        sa_info = ""
+                                        if len(cumulative_metrics['sa_used']) > 1:
+                                            sa_info = f" (cycled through {len(cumulative_metrics['sa_used'])} service accounts: {', '.join(cumulative_metrics['sa_used'])})"
+                                        elif len(cumulative_metrics['sa_used']) == 1:
+                                            sa_info = f" using {cumulative_metrics['sa_used'][0]}"
+                                        
+                                        success_msg = (f"Upload completed for {uploader_remote}: "
+                                                      f"{cumulative_metrics['transfer_count']} files "
+                                                      f"({format_bytes(cumulative_metrics['total_bytes'])}) transferred "
+                                                      f"in {format_duration(total_duration)} "
+                                                      f"at avg {format_bytes(avg_speed)}/s"
+                                                      f"{sa_info}")
+                                        notify.send(message=success_msg)
                                     else:
-                                        notify.send(message=f"Upload completed for {uploader_remote}: no new files to transfer")
+                                        # No files transferred - show cache info
+                                        mode_info = "Weekend - full scan completed" if cumulative_metrics['is_weekend'] else f"{cumulative_metrics['cached_files_excluded']} files already cached"
+                                        notify.send(message=f"Upload completed for {uploader_remote}: no new files to transfer ({mode_info})")
                                 else:
                                     log.info(f"Upload not completed successfully for uploader: {uploader_remote}")
-                                    # send unsuccessful upload notification
-                                    notify.send(message=f"Upload was not completed successfully for remote: {uploader_remote}")
+                                    # send unsuccessful upload notification with partial stats if any
+                                    from utils.uploader import format_bytes, format_duration
+                                    
+                                    if cumulative_metrics['transfer_count'] > 0:
+                                        total_duration = time.time() - cumulative_metrics['start_time']
+                                        fail_msg = (f"Upload was not completed successfully for remote: {uploader_remote}. "
+                                                   f"Partial: {cumulative_metrics['transfer_count']} files "
+                                                   f"({format_bytes(cumulative_metrics['total_bytes'])}) transferred "
+                                                   f"before failure after {format_duration(total_duration)}")
+                                        notify.send(message=fail_msg)
+                                    else:
+                                        notify.send(message=f"Upload was not completed successfully for remote: {uploader_remote} (no files transferred)")
 
                                 # Remove ban for service account
                                 sa_delay[uploader_remote][available_accounts[i]] = None
                                 break
                 else:
-                    resp_delay, resp_trigger, resp_success, transfer_count = uploader.upload()
+                    # No service accounts - single upload run
+                    # Send enhanced start notification with cache info
+                    mode_str = "Weekend - full transfer" if cumulative_metrics['is_weekend'] else "Weekday - incremental transfer"
+                    notify.send(message=f"Upload starting for {uploader_remote} ({mode_str})")
+                    
+                    # Upload returns a dict now
+                    resp = uploader.upload()
+                    resp_delay = resp['delayed_check']
+                    resp_trigger = resp['delayed_trigger']
+                    resp_success = resp['success']
+                    transfer_count = resp['transfer_count']
+                    
+                    # Update cumulative metrics
+                    cumulative_metrics['transfer_count'] = transfer_count
+                    cumulative_metrics['total_bytes'] = resp['total_bytes']
+                    cumulative_metrics['duration_seconds'] = resp['duration_seconds']
+                    cumulative_metrics['cached_files_excluded'] = resp['cached_files_excluded']
+                    
                     if resp_delay:
                         if uploader_remote not in uploader_delay:
                             # this uploader was not already in the delay dict, so lets put it there
                             log.info(f"Upload aborted due to trigger: {resp_trigger} being met, {uploader_remote} will continue automatic uploading normally in {resp_delay} hours")
                             # add remote to uploader_delay
                             uploader_delay[uploader_remote] = time.time() + 60 ** 2 * resp_delay
-                            # send aborted upload notification
-                            notify.send(message=f"Upload was aborted for remote: {uploader_remote} due to trigger {resp_trigger}. Uploads suspended for {resp_delay} hours")
+                            # send aborted upload notification with metrics
+                            from utils.uploader import format_bytes, format_duration
+                            total_duration = time.time() - cumulative_metrics['start_time']
+                            avg_speed = cumulative_metrics['total_bytes'] / total_duration if total_duration > 0 else 0
+                            
+                            if cumulative_metrics['transfer_count'] > 0:
+                                abort_msg = (f"Upload was aborted for remote: {uploader_remote} due to trigger {resp_trigger}. "
+                                            f"Partial upload: {cumulative_metrics['transfer_count']} files "
+                                            f"({format_bytes(cumulative_metrics['total_bytes'])}) transferred "
+                                            f"in {format_duration(total_duration)} "
+                                            f"at avg {format_bytes(avg_speed)}/s. "
+                                            f"Uploads suspended for {resp_delay} hours")
+                            else:
+                                abort_msg = f"Upload was aborted for remote: {uploader_remote} due to trigger {resp_trigger}. Uploads suspended for {resp_delay} hours"
+                            notify.send(message=abort_msg)
                         else:
                             # this uploader is already in the delay dict, lets not delay it any further
                             log.info(f"Upload aborted due to trigger: {resp_trigger} being met for {uploader_remote} uploader")
                             # send aborted upload notification
-                            notify.send(message=f"Upload was aborted for remote: {uploader_remote} due to trigger {resp_trigger}.")
+                            from utils.uploader import format_bytes, format_duration
+                            
+                            if cumulative_metrics['transfer_count'] > 0:
+                                total_duration = time.time() - cumulative_metrics['start_time']
+                                avg_speed = cumulative_metrics['total_bytes'] / total_duration if total_duration > 0 else 0
+                                abort_msg = (f"Upload was aborted for remote: {uploader_remote} due to trigger {resp_trigger}. "
+                                            f"Partial upload: {cumulative_metrics['transfer_count']} files "
+                                            f"({format_bytes(cumulative_metrics['total_bytes'])}) transferred "
+                                            f"in {format_duration(total_duration)} "
+                                            f"at avg {format_bytes(avg_speed)}/s")
+                            else:
+                                abort_msg = f"Upload was aborted for remote: {uploader_remote} due to trigger {resp_trigger}."
+                            notify.send(message=abort_msg)
                     else:
                         if resp_success:
                             log.info(f"Upload completed successfully for uploader: {uploader_remote}")
-                            # send successful upload notification with transfer count
-                            if transfer_count > 0:
-                                notify.send(message=f"Upload completed for {uploader_remote}: {transfer_count} files transferred")
+                            # send successful upload notification with metrics
+                            from utils.uploader import format_bytes, format_duration
+                            
+                            if cumulative_metrics['transfer_count'] > 0:
+                                total_duration = time.time() - cumulative_metrics['start_time']
+                                avg_speed = cumulative_metrics['total_bytes'] / total_duration if total_duration > 0 else 0
+                                
+                                success_msg = (f"Upload completed for {uploader_remote}: "
+                                              f"{cumulative_metrics['transfer_count']} files "
+                                              f"({format_bytes(cumulative_metrics['total_bytes'])}) transferred "
+                                              f"in {format_duration(total_duration)} "
+                                              f"at avg {format_bytes(avg_speed)}/s")
+                                notify.send(message=success_msg)
                             else:
-                                notify.send(message=f"Upload completed for {uploader_remote}: no new files to transfer")
+                                # No files transferred - show cache info
+                                mode_info = "Weekend - full scan completed" if cumulative_metrics['is_weekend'] else f"{cumulative_metrics['cached_files_excluded']} files already cached"
+                                notify.send(message=f"Upload completed for {uploader_remote}: no new files to transfer ({mode_info})")
                         else:
                             log.info(f"Upload not completed successfully for uploader: {uploader_remote}")
-                            # send unsuccessful upload notification
-                            notify.send(message=f"Upload was not completed successfully for remote: {uploader_remote}")
+                            # send unsuccessful upload notification with partial stats if any
+                            from utils.uploader import format_bytes, format_duration
+                            
+                            if cumulative_metrics['transfer_count'] > 0:
+                                total_duration = time.time() - cumulative_metrics['start_time']
+                                fail_msg = (f"Upload was not completed successfully for remote: {uploader_remote}. "
+                                           f"Partial: {cumulative_metrics['transfer_count']} files "
+                                           f"({format_bytes(cumulative_metrics['total_bytes'])}) transferred "
+                                           f"before failure after {format_duration(total_duration)}")
+                                notify.send(message=fail_msg)
+                            else:
+                                notify.send(message=f"Upload was not completed successfully for remote: {uploader_remote} (no files transferred)")
 
                         # remove uploader from uploader_delays (as its no longer banned)
                         if uploader_remote in uploader_delay and uploader_delay.pop(uploader_remote, None) is not None:

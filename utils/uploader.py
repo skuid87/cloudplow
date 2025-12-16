@@ -133,6 +133,7 @@ class Uploader:
         self.service_account = None
         self.transfer_cache = transfer_cache
         self.transferred_files = set()
+        self.transferred_file_sizes = {}  # Track file sizes for metrics
         self.json_log_path = json_log_path
         self.rc_url = rc_url
         self.rc_poller = None
@@ -201,16 +202,22 @@ class Uploader:
                 log.warning(f"Error stopping RC polling: {e}")
 
     def upload(self):
+        # Track upload start time for metrics
+        upload_start_time = time.time()
+        
         # Determine if this is a weekend run
         self.is_weekend = datetime.datetime.now().weekday() in [5, 6]
         self.transferred_files = set()
+        self.transferred_file_sizes = {}  # Reset file sizes tracking
+        cached_files_count = 0
         rclone_config = self.rclone_config.copy()
 
         # Load cache and apply excludes on weekdays
         if not self.is_weekend and self.transfer_cache is not None:
             cached_files = self._load_cached_files()
             if cached_files:
-                log.info(f"Weekday run - excluding {len(cached_files)} cached files from transfer")
+                cached_files_count = len(cached_files)
+                log.info(f"Weekday run - excluding {cached_files_count} cached files from transfer")
                 for cached_file in cached_files:
                     rclone_config['rclone_excludes'].append(cached_file)
         elif self.is_weekend:
@@ -273,7 +280,23 @@ class Uploader:
                     self._update_cache_incremental(self.transferred_files)
                 log.info(f"Transferred {len(self.transferred_files)} files")
 
-            return self.delayed_check, self.delayed_trigger, success, len(self.transferred_files)
+            # Calculate comprehensive metrics
+            upload_duration = time.time() - upload_start_time
+            total_bytes = sum(self.transferred_file_sizes.values())
+            avg_speed = total_bytes / upload_duration if upload_duration > 0 else 0
+            
+            # Return comprehensive metrics dict
+            return {
+                'delayed_check': self.delayed_check,
+                'delayed_trigger': self.delayed_trigger,
+                'success': success,
+                'transfer_count': len(self.transferred_files),
+                'total_bytes': total_bytes,
+                'duration_seconds': upload_duration,
+                'avg_speed_bytes': avg_speed,
+                'is_weekend': self.is_weekend,
+                'cached_files_excluded': cached_files_count
+            }
         
         finally:
             # Always stop RC polling when upload completes
@@ -306,6 +329,11 @@ class Uploader:
             if file_path:
                 self.transferred_files.add(file_path)
                 log.debug(f"Captured successful transfer: {file_path}")
+                
+                # Try to get file size from RC stats or disk
+                file_size = self._get_file_size(file_path)
+                if file_size > 0:
+                    self.transferred_file_sizes[file_path] = file_size
                 
                 # Log to JSONL with RC stats enrichment
                 self._log_completed_file(file_path)
@@ -499,3 +527,23 @@ class Uploader:
         # File not in current transferring list (already completed)
         # This is normal - file completed between our last poll and now
         return None
+    
+    def _get_file_size(self, file_path):
+        """Get file size from RC stats or disk"""
+        try:
+            # First try to get size from RC stats
+            if self.rc_poller:
+                rc_stats = self.rc_poller.get_stats()
+                file_stats = self._find_file_in_rc_stats(file_path, rc_stats)
+                if file_stats and 'size' in file_stats:
+                    return file_stats['size']
+            
+            # Fall back to checking file on disk
+            full_path = os.path.join(self.rclone_config['upload_folder'], file_path)
+            if os.path.exists(full_path):
+                return os.path.getsize(full_path)
+            
+            return 0
+        except Exception as e:
+            log.debug(f"Could not get file size for {file_path}: {e}")
+            return 0

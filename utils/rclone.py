@@ -82,13 +82,21 @@ class RcloneMover:
         if 'rclone_extras' not in self.config:
             return ''
 
-        return ' '.join(f"{key}={cmd_quote(value) if isinstance(value, str) else value}" for (key, value) in self.config['rclone_extras'].items()).replace('=None', '').strip()
+        parts = []
+        for key, value in self.config['rclone_extras'].items():
+            if value is None:
+                parts.append(key)
+            elif isinstance(value, str):
+                parts.append(f"{key}={cmd_quote(value)}")
+            else:
+                parts.append(f"{key}={value}")
+        return ' '.join(parts)
 
     def __excludes2string(self):
         if 'rclone_excludes' not in self.config:
             return ''
 
-        return ' '.join(f"--exclude={cmd_quote(glob.escape(value) if value.startswith(os.path.sep) else value) if isinstance(value,str) else value}" for value in self.config['rclone_excludes']).replace('=None', '').strip()
+        return ' '.join(f"--exclude={cmd_quote(glob.escape(value)) if isinstance(value,str) else value}" for value in self.config['rclone_excludes']).replace('=None', '').strip()
 
     def __create_exclude_file(self):
         """Create a temporary file with exclude patterns for rclone --exclude-from"""
@@ -120,7 +128,7 @@ class RcloneMover:
                 for value in self.config['rclone_excludes']:
                     if isinstance(value, str):
                         # Process the same way as __excludes2string
-                        exclude_value = glob.escape(value) if value.startswith(os.path.sep) else value
+                        exclude_value = glob.escape(value)
                         f.write(f"{exclude_value}\n")
         except Exception:
             os.close(fd)
@@ -309,13 +317,20 @@ class RcloneUploader:
 
     # internals
     def __extras2string(self):
-        return ' '.join(f"{key}={cmd_quote(value) if isinstance(value, str) else value}" for (key, value) in
-                        self.config['rclone_extras'].items()).replace('=None', '').strip()
+        parts = []
+        for key, value in self.config['rclone_extras'].items():
+            if value is None:
+                parts.append(key)
+            elif isinstance(value, str):
+                parts.append(f"{key}={cmd_quote(value)}")
+            else:
+                parts.append(f"{key}={value}")
+        return ' '.join(parts)
 
     def __excludes2string(self):
         return ' '.join(
             "--exclude=%s" % (
-                cmd_quote(glob.escape(value) if value.startswith(os.path.sep) else value) if isinstance(value,
+                cmd_quote(glob.escape(value)) if isinstance(value,
                                                                                                         str) else value)
             for value in
             self.config['rclone_excludes']).replace('=None', '').strip()
@@ -350,7 +365,7 @@ class RcloneUploader:
                 for value in self.config['rclone_excludes']:
                     if isinstance(value, str):
                         # Process the same way as __excludes2string
-                        exclude_value = glob.escape(value) if value.startswith(os.path.sep) else value
+                        exclude_value = glob.escape(value)
                         f.write(f"{exclude_value}\n")
         except Exception:
             os.close(fd)
@@ -444,8 +459,15 @@ class RcloneSyncer:
         return False
 
     def __extras2string(self):
-        return ' '.join(f"{key}={cmd_quote(value) if isinstance(value, str) else value}" for (key, value) in
-                        self.rclone_extras.items()).replace('=None', '').strip()
+        parts = []
+        for key, value in self.rclone_extras.items():
+            if value is None:
+                parts.append(key)
+            elif isinstance(value, str):
+                parts.append(f"{key}={cmd_quote(value)}")
+            else:
+                parts.append(f"{key}={value}")
+        return ' '.join(parts)
 
 
 class RcloneThrottler:

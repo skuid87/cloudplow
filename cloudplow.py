@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import datetime
+import json
 import logging
 import os
 import sys
@@ -83,6 +84,16 @@ syncer_delay = cache.get_cache('syncer_bans')
 plex_monitor_thread = None
 sa_delay = cache.get_cache('sa_bans')
 transferred_files_cache = cache.get_cache('transferred_files')
+
+# Quota tracking system
+sa_quota_usage = {}  # Track {uploader: {sa_file: {'bytes': X, 'reset_time': timestamp}}}
+SA_DAILY_QUOTA = 750 * 1024 * 1024 * 1024  # 750GB in bytes
+SA_QUOTA_RESET_HOURS = 24
+
+# Cache file paths
+config_dir = os.path.dirname(conf.settings['config'])
+sa_quota_cache_file = os.path.join(config_dir, 'sa_quota_cache.json')
+learned_sizes_cache_file = os.path.join(config_dir, 'learned_sizes_cache.json')
 
 # JSON transfer stats log path
 json_transfer_log = os.path.join(os.path.dirname(conf.settings['logfile']), 'transfer-stats.jsonl')
@@ -182,6 +193,248 @@ def init_syncers():
             syncer.load(**filtered_config)
     except Exception:
         log.exception("Exception initializing syncer agents: ")
+
+
+############################################################
+# QUOTA TRACKING SYSTEM
+############################################################
+
+def init_sa_quota_tracking():
+    """Initialize SA quota tracking from cache file"""
+    global sa_quota_usage
+    
+    if not os.path.exists(sa_quota_cache_file):
+        log.debug("No existing SA quota cache found, starting fresh")
+        sa_quota_usage = {}
+        return
+    
+    try:
+        with open(sa_quota_cache_file, 'r') as f:
+            sa_quota_usage = json.load(f)
+        log.info("Loaded SA quota tracking from cache")
+        
+        # Clean up expired quotas
+        cleanup_expired_quotas()
+    except Exception as e:
+        log.warning(f"Failed to load SA quota cache: {e}")
+        sa_quota_usage = {}
+
+
+def cleanup_expired_quotas():
+    """Remove quota entries older than 24 hours"""
+    global sa_quota_usage
+    current_time = time.time()
+    
+    for uploader in list(sa_quota_usage.keys()):
+        for sa_file in list(sa_quota_usage[uploader].keys()):
+            reset_time = sa_quota_usage[uploader][sa_file].get('reset_time', 0)
+            if current_time >= reset_time:
+                log.info(f"Quota reset for SA: {os.path.basename(sa_file)}")
+                del sa_quota_usage[uploader][sa_file]
+        
+        # Clean up empty uploader entries
+        if not sa_quota_usage[uploader]:
+            del sa_quota_usage[uploader]
+
+
+def save_sa_quota_cache():
+    """Save SA quota tracking to cache file"""
+    try:
+        with open(sa_quota_cache_file, 'w') as f:
+            json.dump(sa_quota_usage, f, indent=2)
+        log.debug("Saved SA quota cache")
+    except Exception as e:
+        log.warning(f"Failed to save SA quota cache: {e}")
+
+
+def get_sa_remaining_quota(uploader_remote, sa_file):
+    """
+    Calculate remaining quota for a service account
+    Returns remaining bytes
+    """
+    global sa_quota_usage
+    
+    if uploader_remote not in sa_quota_usage:
+        sa_quota_usage[uploader_remote] = {}
+    
+    if sa_file not in sa_quota_usage[uploader_remote]:
+        # First use of this SA in current period
+        return SA_DAILY_QUOTA
+    
+    used_bytes = sa_quota_usage[uploader_remote][sa_file].get('bytes', 0)
+    reset_time = sa_quota_usage[uploader_remote][sa_file].get('reset_time', 0)
+    
+    # Check if quota period has expired
+    if time.time() >= reset_time:
+        log.info(f"Quota period expired for {os.path.basename(sa_file)}, resetting to full capacity")
+        del sa_quota_usage[uploader_remote][sa_file]
+        return SA_DAILY_QUOTA
+    
+    remaining = SA_DAILY_QUOTA - used_bytes
+    return max(0, remaining)
+
+
+def update_sa_quota_usage(uploader_remote, sa_file, bytes_uploaded):
+    """Update quota usage for a service account"""
+    global sa_quota_usage
+    from utils.distribution import format_bytes
+    
+    if uploader_remote not in sa_quota_usage:
+        sa_quota_usage[uploader_remote] = {}
+    
+    if sa_file not in sa_quota_usage[uploader_remote]:
+        # Initialize with 24-hour reset time from first upload
+        sa_quota_usage[uploader_remote][sa_file] = {
+            'bytes': 0,
+            'reset_time': time.time() + (SA_QUOTA_RESET_HOURS * 3600),
+            'first_upload': time.time()
+        }
+    
+    # Add to accumulated bytes
+    sa_quota_usage[uploader_remote][sa_file]['bytes'] += bytes_uploaded
+    
+    log.debug(f"Updated quota for {os.path.basename(sa_file)}: "
+              f"{format_bytes(sa_quota_usage[uploader_remote][sa_file]['bytes'])} / "
+              f"{format_bytes(SA_DAILY_QUOTA)}")
+    
+    # Save to cache after each update
+    save_sa_quota_cache()
+
+
+############################################################
+# DYNAMIC PARAMETER CALCULATION
+############################################################
+
+def calculate_stage_params_with_distribution(sa_quota_remaining, learned_dist):
+    """
+    Use full distribution data to make intelligent staging decisions
+    
+    Args:
+        sa_quota_remaining: Remaining SA quota (bytes)
+        learned_dist: Full distribution dict from cache (or None)
+    
+    Returns:
+        dict with max_transfer, max_size, transfers, strategy
+    """
+    from utils.distribution import format_bytes
+    import math
+    
+    safe_quota = int(sa_quota_remaining * 0.95)  # 5% buffer
+    
+    # Extract distribution metrics if available
+    if learned_dist:
+        max_file = learned_dist.get('max_file_size', 0)
+        percentiles = learned_dist.get('percentiles', {})
+        p50 = percentiles.get('p50', 0)
+        p75 = percentiles.get('p75', 0)
+        p90 = percentiles.get('p90', 0)
+        p95 = percentiles.get('p95', 0)
+        p99 = percentiles.get('p99', 0)
+        
+        large_file_pct = learned_dist.get('large_file_percentage', 0)
+        confidence = learned_dist.get('metadata', {}).get('confidence', 'low')
+        
+        log.info(f"Distribution: P50={format_bytes(p50)}, P75={format_bytes(p75)}, "
+                 f"P90={format_bytes(p90)}, P95={format_bytes(p95)}, Max={format_bytes(max_file)}")
+        log.info(f"Large files (50GB+): {large_file_pct:.1f}%, confidence={confidence}")
+    else:
+        # No learned data
+        max_file = 0
+        p75 = 0
+        p90 = 0
+        p95 = 0
+        p99 = 0
+        large_file_pct = 0
+        confidence = 'none'
+        log.info("No learned distribution data - using conservative defaults")
+    
+    # === STAGE SIZE CALCULATION ===
+    if safe_quota > 600 * 1024**3:
+        base_stage = 400 * 1024**3
+    elif safe_quota > 400 * 1024**3:
+        base_stage = 300 * 1024**3
+    elif safe_quota > 200 * 1024**3:
+        base_stage = 250 * 1024**3
+    else:
+        base_stage = int(safe_quota * 0.8)
+    
+    stage_size = min(base_stage, safe_quota)
+    
+    # === STRATEGY SELECTION ===
+    if not learned_dist or max_file == 0:
+        # No learned data - conservative
+        strategy = "conservative_default"
+        reference_size = 0
+        transfers = 2
+        
+    elif large_file_pct > 10:
+        # Lots of large files (>10%) - ultra conservative
+        strategy = "ultra_conservative"
+        reference_size = p95 if p95 > 0 else max_file
+        headroom = safe_quota - stage_size
+        if reference_size > 0:
+            transfers = max(1, min(4, int(headroom * 0.25 / reference_size)))
+        else:
+            transfers = 2
+            
+    elif large_file_pct > 2:
+        # Some large files (2-10%) - conservative
+        strategy = "conservative"
+        reference_size = p90 if p90 > 0 else p75
+        headroom = safe_quota - stage_size
+        if reference_size > 0:
+            transfers = max(1, min(6, int(headroom * 0.35 / reference_size)))
+        else:
+            transfers = 3
+            
+    elif large_file_pct > 0.5:
+        # Few large files (0.5-2%) - balanced
+        strategy = "balanced"
+        reference_size = p75 if p75 > 0 else p50
+        headroom = safe_quota - stage_size
+        if reference_size > 0:
+            conservative = max(1, int(headroom / max_file)) if max_file > 0 else 4
+            optimistic = max(1, int(stage_size / reference_size))
+            transfers = max(1, min(8, int(math.sqrt(conservative * optimistic))))
+        else:
+            transfers = 4
+            
+    else:
+        # Very few large files (<0.5%) - aggressive
+        strategy = "aggressive"
+        reference_size = p75 if p75 > 0 else p50
+        headroom = safe_quota - stage_size
+        if reference_size > 0:
+            optimistic = int(stage_size / reference_size) if reference_size > 0 else 8
+            safety_ceiling = max(1, int(headroom / max_file)) if max_file > 0 else 8
+            transfers = max(1, min(8, optimistic, safety_ceiling + 3))
+        else:
+            transfers = 6
+    
+    # Confidence adjustment
+    if confidence in ['low', 'medium']:
+        transfers = max(1, transfers - 1)
+        log.info(f"Confidence is {confidence} - reducing transfers conservatively")
+    
+    # === INTELLIGENT MAX-SIZE FILTERING ===
+    if max_file > 0 and p99 > 0 and max_file > p99 * 1.5 and safe_quota < max_file * 2:
+        # Quota too tight for max files, filter them out
+        effective_max_size = int(p99 * 1.1)
+        log.info(f"Quota tight: filtering files larger than {format_bytes(effective_max_size)}")
+    else:
+        effective_max_size = safe_quota
+    
+    log.info(f"Stage params: size={format_bytes(stage_size)}, transfers={transfers}, "
+             f"strategy={strategy}")
+    
+    return {
+        'max_transfer': f"{int(stage_size / 1024**3)}G",
+        'max_size': f"{int(effective_max_size / 1024**3)}G",
+        'transfers': transfers,
+        'stage_size_bytes': stage_size,
+        'strategy': strategy,
+        'confidence': confidence
+    }
 
 
 def check_suspended_sa(uploader_to_check):
@@ -389,45 +642,178 @@ def do_upload(remote=None):
                         # Send notification about no available accounts
                         notify.send(message=f"Upload skipped for {uploader_remote}: All service accounts are currently suspended. Next available in {misc.seconds_to_string(int(time_till_unban - time.time()))}")
                     else:
+                        # Load learned distribution for this uploader
+                        from utils.distribution import load_learned_distribution
+                        learned_dist = load_learned_distribution(
+                            learned_sizes_cache_file,
+                            uploader_remote,
+                            rclone_config['upload_folder']
+                        )
+                        
+                        # Clean up expired quotas before starting
+                        cleanup_expired_quotas()
+                        
                         # Update start notification with SA info
                         notify.send(message=f"Upload starting for {uploader_remote} using service account: {available_accounts[0]} ({available_accounts_size} accounts available)")
                         
                         for i in range(available_accounts_size):
-                            uploader.set_service_account(available_accounts[i])
+                            sa_file = available_accounts[i]
                             sa_start_time = time.time()
                             
-                            # Upload returns a dict now
-                            resp = uploader.upload()
-                            resp_delay = resp['delayed_check']
-                            resp_trigger = resp['delayed_trigger']
-                            resp_success = resp['success']
-                            transfer_count = resp['transfer_count']
+                            # Check remaining quota for this SA
+                            sa_quota_remaining = get_sa_remaining_quota(uploader_remote, sa_file)
                             
-                            # Accumulate metrics from this SA's run
-                            cumulative_metrics['transfer_count'] += transfer_count
-                            cumulative_metrics['total_bytes'] += resp['total_bytes']
-                            cumulative_metrics['duration_seconds'] += resp['duration_seconds']
-                            cumulative_metrics['sa_used'].append(available_accounts[i])
-                            if resp['cached_files_excluded'] > 0:
-                                cumulative_metrics['cached_files_excluded'] = resp['cached_files_excluded']
+                            # Skip SA if insufficient quota
+                            if sa_quota_remaining < 1 * 1024**3:  # Less than 1GB
+                                from utils.distribution import format_bytes
+                                log.warning(f"SA {os.path.basename(sa_file)} has insufficient quota ({format_bytes(sa_quota_remaining)}), skipping")
+                                # Mark as temporarily suspended until quota resets
+                                if sa_file in sa_quota_usage.get(uploader_remote, {}):
+                                    reset_time = sa_quota_usage[uploader_remote][sa_file].get('reset_time')
+                                    if reset_time:
+                                        current_data = sa_delay[uploader_remote]
+                                        current_data[sa_file] = reset_time
+                                        sa_delay[uploader_remote] = current_data
+                                continue
+                            
+                            # === MULTI-STAGE LOOP FOR THIS SA ===
+                            stage_number = 1
+                            sa_total_uploaded = 0
+                            resp_delay = 0
+                            resp_trigger = ""
+                            resp_success = False
+                            
+                            while sa_quota_remaining > 10 * 1024**3:  # Continue while >10GB remains
+                                from utils.distribution import format_bytes
+                                log.info(f"SA {i+1}/{available_accounts_size} ({os.path.basename(sa_file)}), "
+                                         f"Stage {stage_number}: {format_bytes(sa_quota_remaining)} remaining")
+                                
+                                # Calculate dynamic parameters for this stage
+                                stage_params = calculate_stage_params_with_distribution(
+                                    sa_quota_remaining,
+                                    learned_dist
+                                )
+                                
+                                # Create dynamic rclone config for this stage
+                                dynamic_rclone_config = rclone_config.copy()
+                                if 'rclone_extras' not in dynamic_rclone_config:
+                                    dynamic_rclone_config['rclone_extras'] = {}
+                                
+                                # Apply dynamic parameters
+                                dynamic_rclone_config['rclone_extras']['--max-transfer'] = stage_params['max_transfer']
+                                dynamic_rclone_config['rclone_extras']['--max-size'] = stage_params['max_size']
+                                dynamic_rclone_config['rclone_extras']['--transfers'] = stage_params['transfers']
+                                dynamic_rclone_config['rclone_extras']['--cutoff-mode'] = 'cautious'
+                                
+                                # Create uploader with dynamic config for this stage
+                                stage_uploader = Uploader(
+                                    uploader_remote,
+                                    uploader_config,
+                                    dynamic_rclone_config,
+                                    conf.configs['core']['rclone_binary_path'],
+                                    conf.configs['core']['rclone_config_path'],
+                                    conf.configs['plex'],
+                                    conf.configs['core']['dry_run'],
+                                    transferred_files_cache,
+                                    json_transfer_log,
+                                    rc_url
+                                )
+                                stage_uploader.set_service_account(sa_file)
+                                
+                                log.info(f"Starting stage {stage_number} with: "
+                                         f"transfers={stage_params['transfers']}, "
+                                         f"max-transfer={stage_params['max_transfer']}, "
+                                         f"strategy={stage_params['strategy']}")
+                                
+                                # Run this stage
+                                resp = stage_uploader.upload()
+                                resp_delay = resp['delayed_check']
+                                resp_trigger = resp['delayed_trigger']
+                                resp_success = resp['success']
+                                transfer_count = resp['transfer_count']
+                                bytes_uploaded = resp['total_bytes']
+                                
+                                # Update quota tracking
+                                update_sa_quota_usage(uploader_remote, sa_file, bytes_uploaded)
+                                sa_quota_remaining = get_sa_remaining_quota(uploader_remote, sa_file)
+                                sa_total_uploaded += bytes_uploaded
+                                
+                                # Update learned distribution with files from this stage
+                                transfer_stats = stage_uploader.get_transfer_statistics()
+                                if transfer_stats['count'] > 0:
+                                    from utils.distribution import update_distribution_cache
+                                    update_distribution_cache(
+                                        learned_sizes_cache_file,
+                                        uploader_remote,
+                                        transfer_stats['file_sizes'],
+                                        rclone_config['upload_folder']
+                                    )
+                                    # Reload distribution for next stage
+                                    learned_dist = load_learned_distribution(
+                                        learned_sizes_cache_file,
+                                        uploader_remote,
+                                        rclone_config['upload_folder']
+                                    )
+                                
+                                log.info(f"Stage {stage_number} complete: uploaded {format_bytes(bytes_uploaded)}, "
+                                         f"quota remaining: {format_bytes(sa_quota_remaining)}")
+                                
+                                # Accumulate metrics from this stage
+                                cumulative_metrics['transfer_count'] += transfer_count
+                                cumulative_metrics['total_bytes'] += bytes_uploaded
+                                cumulative_metrics['duration_seconds'] += resp['duration_seconds']
+                                if resp['cached_files_excluded'] > 0:
+                                    cumulative_metrics['cached_files_excluded'] = resp['cached_files_excluded']
+                                
+                                # Check stage completion status
+                                # Exit code 7 = max-transfer reached, continue to next stage
+                                # Exit code 0 = all files done, SA complete
+                                # Other = error or trigger, abort SA
+                                
+                                if resp_delay:
+                                    # Trigger was hit - exit stage loop
+                                    log.info(f"Stage {stage_number} aborted due to trigger: {resp_trigger}")
+                                    break
+                                
+                                # If we successfully completed but no more quota, exit
+                                if sa_quota_remaining < 10 * 1024**3:
+                                    log.info(f"SA {os.path.basename(sa_file)} quota depleted after {stage_number} stages")
+                                    break
+                                
+                                # Continue to next stage
+                                stage_number += 1
+                            
+                            # === END OF STAGE LOOP ===
+                            
+                            # Record that this SA was used
+                            if sa_file not in cumulative_metrics['sa_used']:
+                                cumulative_metrics['sa_used'].append(sa_file)
+                            
+                            log.info(f"SA {os.path.basename(sa_file)} complete after {stage_number} stage(s), "
+                                     f"total uploaded: {format_bytes(sa_total_uploaded)}")
+                            
+                            # Handle delays and triggers
                             if resp_delay:
                                 current_data = sa_delay[uploader_remote]
-                                current_data[available_accounts[i]] = time.time() + ((60 * 60) * resp_delay)
+                                current_data[sa_file] = time.time() + ((60 * 60) * resp_delay)
                                 sa_delay[uploader_remote] = current_data
-                                log.debug(f"Setting account {available_accounts[i]} as unbanned at {sa_delay[uploader_remote][available_accounts[i]]}")
+                                log.debug(f"Setting account {os.path.basename(sa_file)} as unbanned at {sa_delay[uploader_remote][sa_file]}")
+                                
                                 if i != (len(available_accounts) - 1):
                                     log.info(f"Upload aborted due to trigger: {resp_trigger} being met, {uploader_remote} is cycling to service_account file: {available_accounts[i + 1]}")
                                     # Set unban time for current service account
-                                    log.debug(f"Setting service account {available_accounts[i]} as banned for remote: {uploader_remote}")
+                                    log.debug(f"Setting service account {os.path.basename(sa_file)} as banned for remote: {uploader_remote}")
                                     
                                     # Send SA cycling notification with this SA's stats and cumulative totals
-                                    from utils.uploader import format_bytes, format_duration
-                                    sa_msg = (f"Service account {available_accounts[i]} hit '{resp_trigger}' for {uploader_remote}. "
-                                             f"This SA uploaded: {transfer_count} files ({format_bytes(resp['total_bytes'])}) "
-                                             f"in {format_duration(resp['duration_seconds'])}. "
+                                    from utils.distribution import format_bytes
+                                    from utils.uploader import format_duration
+                                    sa_duration = time.time() - sa_start_time
+                                    sa_msg = (f"Service account {os.path.basename(sa_file)} hit '{resp_trigger}' for {uploader_remote}. "
+                                             f"This SA uploaded: {format_bytes(sa_total_uploaded)} across {stage_number} stage(s) "
+                                             f"in {format_duration(sa_duration)}. "
                                              f"Session total so far: {cumulative_metrics['transfer_count']} files "
                                              f"({format_bytes(cumulative_metrics['total_bytes'])}). "
-                                             f"Cycling to {available_accounts[i + 1]} ({available_accounts_size - i - 1} remaining)")
+                                             f"Cycling to {os.path.basename(available_accounts[i + 1])} ({available_accounts_size - i - 1} remaining)")
                                     notify.send(message=sa_msg)
                                     
                                     continue
@@ -503,7 +889,7 @@ def do_upload(remote=None):
                                         notify.send(message=f"Upload was not completed successfully for remote: {uploader_remote} (no files transferred)")
 
                                 # Remove ban for service account
-                                sa_delay[uploader_remote][available_accounts[i]] = None
+                                sa_delay[uploader_remote][sa_file] = None
                                 break
                 else:
                     # No service accounts - single upload run
@@ -974,6 +1360,8 @@ if __name__ == "__main__":
             init_notifications()
             # initialize service accounts if provided in config
             init_service_accounts()
+            # initialize SA quota tracking
+            init_sa_quota_tracking()
             do_hidden()
             do_upload()
         elif conf.args['cmd'] == 'sync':
@@ -990,6 +1378,8 @@ if __name__ == "__main__":
             init_notifications()
             # initialize service accounts if provided in confing
             init_service_accounts()
+            # initialize SA quota tracking
+            init_sa_quota_tracking()
 
             # add uploaders to schedule
             for uploader, uploader_conf in conf.configs['uploader'].items():

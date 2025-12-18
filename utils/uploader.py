@@ -547,3 +547,23 @@ class Uploader:
         except Exception as e:
             log.debug(f"Could not get file size for {file_path}: {e}")
             return 0
+    
+    def get_transfer_statistics(self):
+        """
+        Get statistics about files transferred in this session
+        Returns dict with max_size, count, total_bytes, and file_sizes dict
+        """
+        if not self.transferred_file_sizes:
+            return {
+                'max_size': 0,
+                'count': 0,
+                'total_bytes': 0,
+                'file_sizes': {}
+            }
+        
+        return {
+            'max_size': max(self.transferred_file_sizes.values()),
+            'count': len(self.transferred_file_sizes),
+            'total_bytes': sum(self.transferred_file_sizes.values()),
+            'file_sizes': self.transferred_file_sizes.copy()
+        }

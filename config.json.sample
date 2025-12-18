@@ -42,6 +42,13 @@
             "url": "http://localhost:7949"
         }
     },
+    "dashboard": {
+        "enabled": true,
+        "host": "0.0.0.0",
+        "port": 47949,
+        "refresh_interval": 3,
+        "debug": false
+    },
     "remotes": {
         "google": {
             "hidden_remote": "google:",

@@ -22,6 +22,7 @@ from utils.syncer import Syncer
 from utils.threads import Thread
 from utils.unionfs import UnionfsHiddenFolder
 from utils.uploader import Uploader
+from utils.session_state import SessionStateTracker
 
 ############################################################
 # INIT
@@ -522,6 +523,82 @@ def run_process(task, manager_dict, **kwargs):
 
 
 ############################################################
+# DASHBOARD AUTO-START
+############################################################
+
+dashboard_process = None
+
+
+def is_dashboard_running():
+    """Check if dashboard is already running by attempting to connect to it"""
+    if 'dashboard' not in conf.configs or not conf.configs['dashboard'].get('enabled'):
+        return False
+    
+    port = conf.configs['dashboard'].get('port', 47949)
+    
+    try:
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        result = sock.connect_ex(('127.0.0.1', port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def start_dashboard_if_needed():
+    """Start dashboard in background if enabled and not already running"""
+    global dashboard_process
+    
+    # Check if dashboard is enabled
+    if 'dashboard' not in conf.configs or not conf.configs['dashboard'].get('enabled'):
+        log.debug("Dashboard not enabled in config, skipping auto-start")
+        return False
+    
+    # Check if already running
+    if is_dashboard_running():
+        log.info("Dashboard is already running")
+        return True
+    
+    # Start dashboard in background
+    try:
+        import subprocess
+        dashboard_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dashboard', 'app.py')
+        
+        if not os.path.exists(dashboard_script):
+            log.warning(f"Dashboard script not found at {dashboard_script}, skipping auto-start")
+            return False
+        
+        log.info("Starting dashboard in background...")
+        
+        # Start dashboard as subprocess (detached)
+        dashboard_process = subprocess.Popen(
+            [sys.executable, dashboard_script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        
+        # Give it a moment to start
+        time.sleep(2)
+        
+        # Verify it started
+        if is_dashboard_running():
+            port = conf.configs['dashboard'].get('port', 47949)
+            log.info(f"Dashboard started successfully on port {port}")
+            log.info(f"Access dashboard at: http://localhost:{port}")
+            return True
+        else:
+            log.warning("Dashboard process started but not responding on port")
+            return False
+            
+    except Exception as e:
+        log.warning(f"Failed to auto-start dashboard: {e}")
+        return False
+
+
+############################################################
 # DOER FUNCS
 ############################################################
 
@@ -543,6 +620,13 @@ def do_upload(remote=None):
 
     with lock_file:
         log.info("Starting upload")
+        
+        # Initialize session state tracker for dashboard
+        session_tracker = SessionStateTracker(config_dir)
+        
+        # Auto-start dashboard if enabled and not already running
+        start_dashboard_if_needed()
+        
         try:
             # loop each supplied uploader config
             for uploader_remote, uploader_config in conf.configs['uploader'].items():
@@ -656,9 +740,23 @@ def do_upload(remote=None):
                         # Update start notification with SA info
                         notify.send(message=f"Upload starting for {uploader_remote} using service account: {available_accounts[0]} ({available_accounts_size} accounts available)")
                         
+                        # Start dashboard session
+                        session_tracker.start_session(
+                            uploader=uploader_remote,
+                            total_sas=available_accounts_size,
+                            upload_folder=rclone_config['upload_folder']
+                        )
+                        
                         for i in range(available_accounts_size):
                             sa_file = available_accounts[i]
                             sa_start_time = time.time()
+                            
+                            # Update current SA in dashboard
+                            session_tracker.update_sa(
+                                sa_index=i,
+                                sa_file=sa_file,
+                                total_sas=available_accounts_size
+                            )
                             
                             # Check remaining quota for this SA
                             sa_quota_remaining = get_sa_remaining_quota(uploader_remote, sa_file)
@@ -689,6 +787,9 @@ def do_upload(remote=None):
                                 from utils.distribution import format_bytes
                                 log.info(f"SA {i+1}/{available_accounts_size} ({os.path.basename(sa_file)}), "
                                          f"Stage {stage_number}: {format_bytes(sa_quota_remaining)} remaining")
+                                
+                                # Update current stage in dashboard
+                                session_tracker.update_stage(stage_number)
                                 
                                 # Calculate dynamic parameters for this stage using QUEUE distribution only
                                 stage_params = calculate_stage_params_with_distribution(
@@ -1040,6 +1141,9 @@ def do_upload(remote=None):
                         if uploader_remote in uploader_delay and uploader_delay.pop(uploader_remote, None) is not None:
                             # this uploader was in the delay dict, but upload was successful, lets remove it
                             log.info(f"{uploader_remote} is no longer suspended due to a previous aborted upload!")
+                        
+                        # End dashboard session after all SAs complete
+                        session_tracker.end_session()
 
                 # remove leftover empty directories from disk
                 if not conf.configs['core']['dry_run']:
@@ -1104,6 +1208,11 @@ def do_upload(remote=None):
         except Exception:
             log.exception("Exception occurred while uploading: ")
             notify.send(message="Exception occurred while uploading: ")
+            # End dashboard session on exception
+            try:
+                session_tracker.end_session()
+            except:
+                pass
 
     log.info("Finished upload")
 

@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flask import Flask, render_template, jsonify, request
 from utils.dashboard_data import DashboardDataProvider
-from utils import config
+import json
 
 # Setup logging
 logging.basicConfig(
@@ -26,18 +26,29 @@ log = logging.getLogger('dashboard')
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
 
-# Load configuration
-conf = config.Config()
-conf.load()
+# Load configuration directly (avoiding argparse from Config class)
+config_file = '/config/config.json'
+if not os.path.exists(config_file):
+    config_file = '/opt/cloudplow/config.json'
+    if not os.path.exists(config_file):
+        config_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config.json')
+
+try:
+    with open(config_file, 'r') as f:
+        conf_data = json.load(f)
+    log.info(f"Loaded config from {config_file}")
+except Exception as e:
+    log.error(f"Failed to load config from {config_file}: {e}")
+    conf_data = {}
 
 # Get configuration
-dashboard_config = conf.configs.get('dashboard', {})
-config_dir = os.path.dirname(conf.settings.get('config', './config.json'))
+dashboard_config = conf_data.get('dashboard', {})
+config_dir = os.path.dirname(config_file)
 rc_url = None
 
-# Try to get RC URL from plex config (existing pattern)
-if 'plex' in conf.configs and 'rclone' in conf.configs['plex']:
-    rc_url = conf.configs['plex']['rclone'].get('url')
+# Try to get RC URL from plex config
+if 'plex' in conf_data and 'rclone' in conf_data['plex']:
+    rc_url = conf_data['plex']['rclone'].get('url')
 
 # Initialize data provider
 data_provider = DashboardDataProvider(config_dir, rc_url)

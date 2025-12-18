@@ -642,9 +642,9 @@ def do_upload(remote=None):
                         # Send notification about no available accounts
                         notify.send(message=f"Upload skipped for {uploader_remote}: All service accounts are currently suspended. Next available in {misc.seconds_to_string(int(time_till_unban - time.time()))}")
                     else:
-                        # Load learned distribution for this uploader
-                        from utils.distribution import load_learned_distribution
-                        learned_dist = load_learned_distribution(
+                        # Try to load existing queue distribution for decision-making
+                        from utils.distribution import load_queue_distribution
+                        queue_dist = load_queue_distribution(
                             learned_sizes_cache_file,
                             uploader_remote,
                             rclone_config['upload_folder']
@@ -682,16 +682,18 @@ def do_upload(remote=None):
                             resp_delay = 0
                             resp_trigger = ""
                             resp_success = False
+                            queue_learned_this_session = False
+                            session_start_time = time.time()
                             
                             while sa_quota_remaining > 10 * 1024**3:  # Continue while >10GB remains
                                 from utils.distribution import format_bytes
                                 log.info(f"SA {i+1}/{available_accounts_size} ({os.path.basename(sa_file)}), "
                                          f"Stage {stage_number}: {format_bytes(sa_quota_remaining)} remaining")
                                 
-                                # Calculate dynamic parameters for this stage
+                                # Calculate dynamic parameters for this stage using QUEUE distribution only
                                 stage_params = calculate_stage_params_with_distribution(
                                     sa_quota_remaining,
-                                    learned_dist
+                                    queue_dist
                                 )
                                 
                                 # Create dynamic rclone config for this stage
@@ -725,8 +727,60 @@ def do_upload(remote=None):
                                          f"max-transfer={stage_params['max_transfer']}, "
                                          f"strategy={stage_params['strategy']}")
                                 
+                                # Start the upload (rclone will begin checking files)
+                                # We'll monitor checkers in a separate thread to capture queue distribution
+                                upload_start_time = time.time()
+                                
+                                # If this is the first stage and we don't have queue distribution yet, capture it
+                                if stage_number == 1 and not queue_learned_this_session and queue_dist is None and rc_url:
+                                    log.info("No queue distribution available - will capture during checking phase")
+                                    
+                                    # Start queue monitoring in background thread
+                                    import threading
+                                    queue_tracker = {'result': None, 'duration': 0}
+                                    
+                                    def monitor_queue():
+                                        from utils.distribution import capture_queue_distribution_from_checkers
+                                        start = time.time()
+                                        tracker = capture_queue_distribution_from_checkers(
+                                            rc_url,
+                                            rclone_config['upload_folder'],
+                                            timeout=300
+                                        )
+                                        queue_tracker['result'] = tracker
+                                        queue_tracker['duration'] = time.time() - start
+                                    
+                                    monitor_thread = threading.Thread(target=monitor_queue, daemon=True)
+                                    monitor_thread.start()
+                                
                                 # Run this stage
                                 resp = stage_uploader.upload()
+                                
+                                # If we were monitoring queue, wait for it and save
+                                if stage_number == 1 and not queue_learned_this_session and queue_dist is None and rc_url:
+                                    if monitor_thread.is_alive():
+                                        log.info("Waiting for queue distribution capture to complete...")
+                                        monitor_thread.join(timeout=10)
+                                    
+                                    if queue_tracker['result']:
+                                        from utils.distribution import save_queue_distribution
+                                        save_queue_distribution(
+                                            learned_sizes_cache_file,
+                                            uploader_remote,
+                                            queue_tracker['result'],
+                                            rclone_config['upload_folder'],
+                                            queue_tracker['duration']
+                                        )
+                                        # Load it for subsequent stages
+                                        from utils.distribution import load_queue_distribution
+                                        queue_dist = load_queue_distribution(
+                                            learned_sizes_cache_file,
+                                            uploader_remote,
+                                            rclone_config['upload_folder']
+                                        )
+                                        queue_learned_this_session = True
+                                    else:
+                                        log.warning("Failed to capture queue distribution from checkers")
                                 resp_delay = resp['delayed_check']
                                 resp_trigger = resp['delayed_trigger']
                                 resp_success = resp['success']
@@ -738,21 +792,20 @@ def do_upload(remote=None):
                                 sa_quota_remaining = get_sa_remaining_quota(uploader_remote, sa_file)
                                 sa_total_uploaded += bytes_uploaded
                                 
-                                # Update learned distribution with files from this stage
+                                # Save transfer history for analysis/visibility only (NOT used in decisions)
                                 transfer_stats = stage_uploader.get_transfer_statistics()
                                 if transfer_stats['count'] > 0:
-                                    from utils.distribution import update_distribution_cache
-                                    update_distribution_cache(
+                                    from utils.distribution import save_transfer_history
+                                    save_transfer_history(
                                         learned_sizes_cache_file,
                                         uploader_remote,
                                         transfer_stats['file_sizes'],
-                                        rclone_config['upload_folder']
-                                    )
-                                    # Reload distribution for next stage
-                                    learned_dist = load_learned_distribution(
-                                        learned_sizes_cache_file,
-                                        uploader_remote,
-                                        rclone_config['upload_folder']
+                                        rclone_config['upload_folder'],
+                                        {
+                                            'session_start': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session_start_time)),
+                                            'stage_number': stage_number,
+                                            'sa_file': os.path.basename(sa_file)
+                                        }
                                     )
                                 
                                 log.info(f"Stage {stage_number} complete: uploaded {format_bytes(bytes_uploaded)}, "

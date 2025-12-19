@@ -96,8 +96,14 @@ class RCStatsPoller(threading.Thread):
         if not transferring:
             return 10  # No active transfers, slow poll
         
-        # Look at ETAs of current transfers
-        min_eta = min((t.get('eta', 999) for t in transferring), default=999)
+        # Look at ETAs of current transfers, filtering out None values
+        etas = [t.get('eta') for t in transferring if t.get('eta') is not None]
+        
+        if not etas:
+            # No ETAs available yet (files just starting)
+            return 5  # Poll at medium frequency
+        
+        min_eta = min(etas)
         
         if min_eta < 15:
             return 2  # Fast completing file, poll aggressively

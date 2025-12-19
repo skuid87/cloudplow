@@ -306,136 +306,69 @@ def update_sa_quota_usage(uploader_remote, sa_file, bytes_uploaded):
 # DYNAMIC PARAMETER CALCULATION
 ############################################################
 
-def calculate_stage_params_with_distribution(sa_quota_remaining, learned_dist):
+def calculate_stage_params_quota_based(remaining_quota_bytes, sa_daily_quota=750*1024**3):
     """
-    Use full distribution data to make intelligent staging decisions
+    Calculate stage parameters based purely on remaining SA quota
+    Returns parameters including dynamic ordering flags
     
     Args:
-        sa_quota_remaining: Remaining SA quota (bytes)
-        learned_dist: Full distribution dict from cache (or None)
+        remaining_quota_bytes: Remaining SA quota in bytes
+        sa_daily_quota: Daily quota limit in bytes (default 750GB)
     
     Returns:
-        dict with max_transfer, max_size, transfers, strategy
+        dict with max_transfer, max_size, transfers, strategy, order_by, max_backlog
     """
     from utils.distribution import format_bytes
-    import math
     
-    safe_quota = int(sa_quota_remaining * 0.95)  # 5% buffer
+    quota_percent = (remaining_quota_bytes / sa_daily_quota) * 100
     
-    # Extract distribution metrics if available
-    if learned_dist:
-        max_file = learned_dist.get('max_file_size', 0)
-        percentiles = learned_dist.get('percentiles', {})
-        p50 = percentiles.get('p50', 0)
-        p75 = percentiles.get('p75', 0)
-        p90 = percentiles.get('p90', 0)
-        p95 = percentiles.get('p95', 0)
-        p99 = percentiles.get('p99', 0)
-        
-        large_file_pct = learned_dist.get('large_file_percentage', 0)
-        confidence = learned_dist.get('metadata', {}).get('confidence', 'low')
-        
-        log.info(f"Distribution: P50={format_bytes(p50)}, P75={format_bytes(p75)}, "
-                 f"P90={format_bytes(p90)}, P95={format_bytes(p95)}, Max={format_bytes(max_file)}")
-        log.info(f"Large files (50GB+): {large_file_pct:.1f}%, confidence={confidence}")
-    else:
-        # No learned data
-        max_file = 0
-        p75 = 0
-        p90 = 0
-        p95 = 0
-        p99 = 0
-        large_file_pct = 0
-        confidence = 'none'
-        log.info("No learned distribution data - using conservative defaults")
+    if quota_percent >= 80:  # 600GB+ remaining (Fresh SA)
+        return {
+            'max_transfer': f"{int(remaining_quota_bytes * 0.5 / 1024**3)}G",
+            'max_size': f"{int(remaining_quota_bytes * 0.8 / 1024**3)}G",
+            'transfers': 8,
+            'stage_size_bytes': int(remaining_quota_bytes * 0.5),
+            'strategy': 'aggressive_fresh_sa',
+            # Use ordering to prioritize large files when we have quota
+            'order_by': 'size,desc',
+            'max_backlog': 2000
+        }
     
-    # === STAGE SIZE CALCULATION ===
-    if safe_quota > 600 * 1024**3:
-        base_stage = 400 * 1024**3
-    elif safe_quota > 400 * 1024**3:
-        base_stage = 300 * 1024**3
-    elif safe_quota > 200 * 1024**3:
-        base_stage = 250 * 1024**3
-    else:
-        base_stage = int(safe_quota * 0.8)
+    elif quota_percent >= 50:  # 375-600GB remaining
+        return {
+            'max_transfer': f"{int(remaining_quota_bytes * 0.6 / 1024**3)}G",
+            'max_size': f"{int(remaining_quota_bytes * 0.5 / 1024**3)}G",
+            'transfers': 4,
+            'stage_size_bytes': int(remaining_quota_bytes * 0.6),
+            'strategy': 'moderate_mid_sa',
+            # Still use ordering but might have fewer large files left
+            'order_by': 'size,desc',
+            'max_backlog': 1000
+        }
     
-    stage_size = min(base_stage, safe_quota)
+    elif quota_percent >= 25:  # 187-375GB remaining
+        return {
+            'max_transfer': f"{int(remaining_quota_bytes * 0.7 / 1024**3)}G",
+            'max_size': f"{int(remaining_quota_bytes * 0.3 / 1024**3)}G",
+            'transfers': 6,
+            'stage_size_bytes': int(remaining_quota_bytes * 0.7),
+            'strategy': 'cautious_low_quota',
+            # Skip ordering - max-size already restricts to small files
+            'order_by': None,
+            'max_backlog': None
+        }
     
-    # === STRATEGY SELECTION ===
-    if not learned_dist or max_file == 0:
-        # No learned data - conservative
-        strategy = "conservative_default"
-        reference_size = 0
-        transfers = 2
-        
-    elif large_file_pct > 10:
-        # Lots of large files (>10%) - ultra conservative
-        strategy = "ultra_conservative"
-        reference_size = p95 if p95 > 0 else max_file
-        headroom = safe_quota - stage_size
-        if reference_size > 0:
-            transfers = max(1, min(4, int(headroom * 0.25 / reference_size)))
-        else:
-            transfers = 2
-            
-    elif large_file_pct > 2:
-        # Some large files (2-10%) - conservative
-        strategy = "conservative"
-        reference_size = p90 if p90 > 0 else p75
-        headroom = safe_quota - stage_size
-        if reference_size > 0:
-            transfers = max(1, min(6, int(headroom * 0.35 / reference_size)))
-        else:
-            transfers = 3
-            
-    elif large_file_pct > 0.5:
-        # Few large files (0.5-2%) - balanced
-        strategy = "balanced"
-        reference_size = p75 if p75 > 0 else p50
-        headroom = safe_quota - stage_size
-        if reference_size > 0:
-            conservative = max(1, int(headroom / max_file)) if max_file > 0 else 4
-            optimistic = max(1, int(stage_size / reference_size))
-            transfers = max(1, min(8, int(math.sqrt(conservative * optimistic))))
-        else:
-            transfers = 4
-            
-    else:
-        # Very few large files (<0.5%) - aggressive
-        strategy = "aggressive"
-        reference_size = p75 if p75 > 0 else p50
-        headroom = safe_quota - stage_size
-        if reference_size > 0:
-            optimistic = int(stage_size / reference_size) if reference_size > 0 else 8
-            safety_ceiling = max(1, int(headroom / max_file)) if max_file > 0 else 8
-            transfers = max(1, min(8, optimistic, safety_ceiling + 3))
-        else:
-            transfers = 6
-    
-    # Confidence adjustment
-    if confidence in ['low', 'medium']:
-        transfers = max(1, transfers - 1)
-        log.info(f"Confidence is {confidence} - reducing transfers conservatively")
-    
-    # === INTELLIGENT MAX-SIZE FILTERING ===
-    if max_file > 0 and p99 > 0 and max_file > p99 * 1.5 and safe_quota < max_file * 2:
-        # Quota too tight for max files, filter them out
-        effective_max_size = int(p99 * 1.1)
-        log.info(f"Quota tight: filtering files larger than {format_bytes(effective_max_size)}")
-    else:
-        effective_max_size = safe_quota
-    
-    log.info(f"Stage params: size={format_bytes(stage_size)}, transfers={transfers}, "
-             f"strategy={strategy}")
-    
-    return {
-        'max_transfer': f"{int(stage_size / 1024**3)}G",
-        'max_size': f"{int(effective_max_size / 1024**3)}G",
-        'transfers': transfers,
-        'stage_size_bytes': stage_size,
-        'strategy': strategy,
-        'confidence': confidence
-    }
+    else:  # < 187GB remaining (Low quota)
+        return {
+            'max_transfer': f"{int(remaining_quota_bytes * 0.8 / 1024**3)}G",
+            'max_size': f"{int(remaining_quota_bytes * 0.2 / 1024**3)}G",
+            'transfers': 8,
+            'stage_size_bytes': int(remaining_quota_bytes * 0.8),
+            'strategy': 'conservative_cleanup',
+            # Skip ordering - just transfer small files quickly
+            'order_by': None,
+            'max_backlog': None
+        }
 
 
 def check_suspended_sa(uploader_to_check):
@@ -726,14 +659,6 @@ def do_upload(remote=None):
                         # Send notification about no available accounts
                         notify.send(message=f"Upload skipped for {uploader_remote}: All service accounts are currently suspended. Next available in {misc.seconds_to_string(int(time_till_unban - time.time()))}")
                     else:
-                        # Try to load existing queue distribution for decision-making
-                        from utils.distribution import load_queue_distribution
-                        queue_dist = load_queue_distribution(
-                            learned_sizes_cache_file,
-                            uploader_remote,
-                            rclone_config['upload_folder']
-                        )
-                        
                         # Clean up expired quotas before starting
                         cleanup_expired_quotas()
                         
@@ -780,7 +705,6 @@ def do_upload(remote=None):
                             resp_delay = 0
                             resp_trigger = ""
                             resp_success = False
-                            queue_learned_this_session = False
                             session_start_time = time.time()
                             
                             while sa_quota_remaining > 10 * 1024**3:  # Continue while >10GB remains
@@ -791,10 +715,10 @@ def do_upload(remote=None):
                                 # Update current stage in dashboard
                                 session_tracker.update_stage(stage_number)
                                 
-                                # Calculate dynamic parameters for this stage using QUEUE distribution only
-                                stage_params = calculate_stage_params_with_distribution(
+                                # Calculate dynamic parameters for this stage based on quota
+                                stage_params = calculate_stage_params_quota_based(
                                     sa_quota_remaining,
-                                    queue_dist
+                                    SA_DAILY_QUOTA
                                 )
                                 
                                 # Create dynamic rclone config for this stage
@@ -807,6 +731,21 @@ def do_upload(remote=None):
                                 dynamic_rclone_config['rclone_extras']['--max-size'] = stage_params['max_size']
                                 dynamic_rclone_config['rclone_extras']['--transfers'] = stage_params['transfers']
                                 dynamic_rclone_config['rclone_extras']['--cutoff-mode'] = 'cautious'
+                                
+                                # Apply dynamic ordering flags based on strategy
+                                if stage_params.get('order_by'):
+                                    dynamic_rclone_config['rclone_extras']['--order-by'] = stage_params['order_by']
+                                    log.info(f"Ordering files by: {stage_params['order_by']}")
+                                else:
+                                    # Remove ordering if it was in base config (for speed at low quota)
+                                    dynamic_rclone_config['rclone_extras'].pop('--order-by', None)
+                                    log.info("Skipping file ordering for faster start")
+                                
+                                if stage_params.get('max_backlog'):
+                                    dynamic_rclone_config['rclone_extras']['--max-backlog'] = str(stage_params['max_backlog'])
+                                    log.info(f"Max backlog: {stage_params['max_backlog']} files")
+                                else:
+                                    dynamic_rclone_config['rclone_extras'].pop('--max-backlog', None)
                                 
                                 # Create uploader with dynamic config for this stage
                                 stage_uploader = Uploader(
@@ -828,86 +767,23 @@ def do_upload(remote=None):
                                          f"max-transfer={stage_params['max_transfer']}, "
                                          f"strategy={stage_params['strategy']}")
                                 
-                                # Start the upload (rclone will begin checking files)
-                                # We'll monitor checkers in a separate thread to capture queue distribution
+                                # Start the upload
                                 upload_start_time = time.time()
-                                
-                                # If this is the first stage and we don't have queue distribution yet, capture it
-                                if stage_number == 1 and not queue_learned_this_session and queue_dist is None and rc_url:
-                                    log.info("No queue distribution available - will capture during checking phase")
-                                    
-                                    # Start queue monitoring in background thread
-                                    import threading
-                                    queue_tracker = {'result': None, 'duration': 0}
-                                    
-                                    def monitor_queue():
-                                        from utils.distribution import capture_queue_distribution_from_checkers
-                                        start = time.time()
-                                        tracker = capture_queue_distribution_from_checkers(
-                                            rc_url,
-                                            rclone_config['upload_folder'],
-                                            timeout=300
-                                        )
-                                        queue_tracker['result'] = tracker
-                                        queue_tracker['duration'] = time.time() - start
-                                    
-                                    monitor_thread = threading.Thread(target=monitor_queue, daemon=True)
-                                    monitor_thread.start()
                                 
                                 # Run this stage
                                 resp = stage_uploader.upload()
                                 
-                                # If we were monitoring queue, wait for it and save
-                                if stage_number == 1 and not queue_learned_this_session and queue_dist is None and rc_url:
-                                    if monitor_thread.is_alive():
-                                        log.info("Waiting for queue distribution capture to complete...")
-                                        monitor_thread.join(timeout=10)
-                                    
-                                    if queue_tracker['result']:
-                                        from utils.distribution import save_queue_distribution
-                                        save_queue_distribution(
-                                            learned_sizes_cache_file,
-                                            uploader_remote,
-                                            queue_tracker['result'],
-                                            rclone_config['upload_folder'],
-                                            queue_tracker['duration']
-                                        )
-                                        # Load it for subsequent stages
-                                        from utils.distribution import load_queue_distribution
-                                        queue_dist = load_queue_distribution(
-                                            learned_sizes_cache_file,
-                                            uploader_remote,
-                                            rclone_config['upload_folder']
-                                        )
-                                        queue_learned_this_session = True
-                                    else:
-                                        log.warning("Failed to capture queue distribution from checkers")
-                                resp_delay = resp['delayed_check']
-                                resp_trigger = resp['delayed_trigger']
-                                resp_success = resp['success']
-                                transfer_count = resp['transfer_count']
+                                # Process upload response
+                            resp_delay = resp['delayed_check']
+                            resp_trigger = resp['delayed_trigger']
+                            resp_success = resp['success']
+                            transfer_count = resp['transfer_count']
                                 bytes_uploaded = resp['total_bytes']
                                 
                                 # Update quota tracking
                                 update_sa_quota_usage(uploader_remote, sa_file, bytes_uploaded)
                                 sa_quota_remaining = get_sa_remaining_quota(uploader_remote, sa_file)
                                 sa_total_uploaded += bytes_uploaded
-                                
-                                # Save transfer history for analysis/visibility only (NOT used in decisions)
-                                transfer_stats = stage_uploader.get_transfer_statistics()
-                                if transfer_stats['count'] > 0:
-                                    from utils.distribution import save_transfer_history
-                                    save_transfer_history(
-                                        learned_sizes_cache_file,
-                                        uploader_remote,
-                                        transfer_stats['file_sizes'],
-                                        rclone_config['upload_folder'],
-                                        {
-                                            'session_start': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session_start_time)),
-                                            'stage_number': stage_number,
-                                            'sa_file': os.path.basename(sa_file)
-                                        }
-                                    )
                                 
                                 log.info(f"Stage {stage_number} complete: uploaded {format_bytes(bytes_uploaded)}, "
                                          f"quota remaining: {format_bytes(sa_quota_remaining)}")

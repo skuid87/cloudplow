@@ -50,6 +50,10 @@ rc_url = None
 if 'plex' in conf_data and 'rclone' in conf_data['plex']:
     rc_url = conf_data['plex']['rclone'].get('url')
 
+# Fallback to default RC URL if not configured
+if not rc_url:
+    rc_url = 'http://localhost:5572'
+
 # Initialize data provider
 data_provider = DashboardDataProvider(config_dir, rc_url)
 

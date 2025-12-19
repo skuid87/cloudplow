@@ -303,6 +303,7 @@ def capture_queue_distribution_from_checkers(rc_url, upload_folder, timeout=300)
     seen_files = set()
     last_check_count = 0
     no_new_files_count = 0
+    rc_ready = False
     
     log.info("Monitoring rclone checkers to learn file distribution from upload queue...")
     
@@ -311,6 +312,11 @@ def capture_queue_distribution_from_checkers(rc_url, upload_folder, timeout=300)
             try:
                 response = requests.post(f"{rc_url}/core/stats", timeout=5)
                 if response.status_code == 200:
+                    # RC API is now ready
+                    if not rc_ready:
+                        rc_ready = True
+                        log.info("RC API connected successfully")
+                    
                     stats = response.json()
                     
                     # Capture files currently being checked
@@ -352,6 +358,12 @@ def capture_queue_distribution_from_checkers(rc_url, upload_folder, timeout=300)
                     if current_check_count > 0 and current_check_count % 100 == 0:
                         log.info(f"Queue learning progress: {current_check_count} files captured...")
                         
+            except requests.exceptions.ConnectionError as e:
+                # RC API not ready yet - this is expected at startup
+                if not rc_ready:
+                    log.debug(f"Waiting for RC API to become available...")
+                else:
+                    log.debug(f"Connection error after RC was ready: {e}")
             except Exception as e:
                 log.debug(f"Error monitoring checkers: {e}")
             
@@ -366,7 +378,10 @@ def capture_queue_distribution_from_checkers(rc_url, upload_folder, timeout=300)
                         f"Max={format_bytes(stats['max_file_size'])}")
                 return tracker
         else:
-            log.warning("No files captured from checker queue")
+            if not rc_ready:
+                log.warning("RC API never became available - queue capture failed")
+            else:
+                log.warning("No files captured from checker queue (RC was connected)")
             return None
             
     except Exception as e:

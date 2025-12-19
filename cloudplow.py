@@ -774,10 +774,10 @@ def do_upload(remote=None):
                                 resp = stage_uploader.upload()
                                 
                                 # Process upload response
-                            resp_delay = resp['delayed_check']
-                            resp_trigger = resp['delayed_trigger']
-                            resp_success = resp['success']
-                            transfer_count = resp['transfer_count']
+                                resp_delay = resp['delayed_check']
+                                resp_trigger = resp['delayed_trigger']
+                                resp_success = resp['success']
+                                transfer_count = resp['transfer_count']
                                 bytes_uploaded = resp['total_bytes']
                                 
                                 # Update quota tracking

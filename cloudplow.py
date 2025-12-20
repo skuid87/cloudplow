@@ -753,6 +753,7 @@ def do_upload(remote=None):
                                 def update_quota_realtime(bytes_delta):
                                     """Called each time a file completes to update quota in real-time"""
                                     update_sa_quota_usage(uploader_remote, sa_file, bytes_delta)
+                                    session_tracker.update_transferred_realtime(bytes_delta)
                                 
                                 # Create uploader with dynamic config for this stage
                                 stage_uploader = Uploader(

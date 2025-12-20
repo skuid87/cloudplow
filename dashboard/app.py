@@ -97,6 +97,24 @@ def api_queue_distribution():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/queue_status')
+def api_queue_status():
+    """Get queue and strategy status"""
+    try:
+        status = data_provider.get_queue_status()
+        
+        if status is None:
+            return jsonify({'available': False})
+        
+        return jsonify({
+            'available': True,
+            'data': status
+        })
+    except Exception as e:
+        log.error(f"Error in /api/queue_status: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/transfer_history')
 def api_transfer_history():
     """Get transfer history data"""

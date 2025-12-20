@@ -101,6 +101,42 @@ class SessionStateTracker:
         log.debug(f"Updated transferred: +{files_delta} files, +{bytes_delta} bytes "
                  f"(total: {self.session_data['transferred_files']} files, "
                  f"{self.session_data['transferred_bytes']} bytes)")
+
+    def update_transferred_realtime(self, bytes_delta):
+        """Update transferred bytes in real-time (called per file)"""
+        if not self.session_data.get('active'):
+            return
+        
+        # Initialize if not present
+        if 'transferred_bytes' not in self.session_data:
+            self.session_data['transferred_bytes'] = 0
+        if 'transferred_files' not in self.session_data:
+            self.session_data['transferred_files'] = 0
+        
+        # Add deltas
+        self.session_data['transferred_files'] += 1
+        self.session_data['transferred_bytes'] += bytes_delta
+        
+        # Save every 10 files to avoid excessive I/O
+        if self.session_data['transferred_files'] % 10 == 0:
+            self._save()
+            
+    def update_stage_params(self, stage_params):
+        """Update current stage parameters for dashboard display"""
+        if not self.session_data.get('active'):
+            return
+        
+        self.session_data['stage_params'] = {
+            'strategy': stage_params.get('strategy', 'unknown'),
+            'max_transfer': stage_params.get('max_transfer', '0G'),
+            'max_size': stage_params.get('max_size', '0G'),
+            'transfers': stage_params.get('transfers', 0),
+            'order_by': stage_params.get('order_by'),
+            'max_backlog': stage_params.get('max_backlog')
+        }
+        
+        self._save()
+        log.debug(f"Updated stage params: {stage_params.get('strategy', 'unknown')}")
     
     def end_session(self):
         """Mark session as ended"""

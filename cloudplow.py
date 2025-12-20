@@ -775,8 +775,29 @@ def do_upload(remote=None):
                                          f"max-transfer={stage_params['max_transfer']}, "
                                          f"strategy={stage_params['strategy']}")
                                 
+                                # Save stage params to session state for dashboard
+                                session_tracker.update_stage_params(stage_params)
+                                
                                 # Start the upload
                                 upload_start_time = time.time()
+                                
+                                # Capture total files BEFORE stage starts (from initial rclone scan)
+                                if not totals_captured and rc_url and stage_number == 1:
+                                    # Wait a bit for rclone to populate stats
+                                    time.sleep(2)
+                                    try:
+                                        response = requests.post(f"{rc_url}/core/stats", timeout=5)
+                                        if response.status_code == 200:
+                                            stats = response.json()
+                                            total_files = stats.get('listed', 0) or stats.get('totalChecks', 0)
+                                            total_bytes = stats.get('totalBytes', 0)
+                                            
+                                            if total_files > 0:
+                                                session_tracker.set_totals(total_files, total_bytes)
+                                                totals_captured = True
+                                                log.info(f"Captured session totals: {total_files} files, {format_bytes(total_bytes)}")
+                                    except Exception as e:
+                                        log.debug(f"Could not capture totals from RC API: {e}")
                                 
                                 # Run this stage
                                 resp = stage_uploader.upload()

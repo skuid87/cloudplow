@@ -92,16 +92,15 @@
             <!-- Two Column Layout -->
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 
-                <!-- Queue Distribution -->
+                <!-- Queue & Strategy -->
                 <div class="bg-gray-800 rounded-lg border border-gray-700 p-6">
                     <h3 class="text-xl font-semibold mb-4 flex items-center">
                         <svg class="w-6 h-6 mr-2 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
                         </svg>
-                        Queue Distribution
-                        <span id="queue-confidence" class="ml-2 text-xs px-2 py-1 bg-gray-700 rounded"></span>
+                        Queue & Strategy
                     </h3>
-                    <div id="queue-distribution">
+                    <div id="queue-status">
                         <p class="text-gray-400 text-sm">Loading...</p>
                     </div>
                 </div>
@@ -156,15 +155,15 @@
         // Fetch all data
         async function fetchData() {
             try {
-                const [status, queueDist, sessionStats, serviceAccounts, rcloneStats] = await Promise.all([
+                const [status, queueStatus, sessionStats, serviceAccounts, rcloneStats] = await Promise.all([
                     fetch('/api/status').then(r => r.json()),
-                    fetch('/api/queue_distribution').then(r => r.json()),
+                    fetch('/api/queue_status').then(r => r.json()),
                     fetch('/api/session_stats').then(r => r.json()),
                     fetch('/api/service_accounts').then(r => r.json()),
                     fetch('/api/rclone_stats').then(r => r.json())
                 ]);
 
-                updateUI(status, queueDist, sessionStats, serviceAccounts, rcloneStats);
+                updateUI(status, queueStatus, sessionStats, serviceAccounts, rcloneStats);
                 updateStatusIndicator(true);
             } catch (error) {
                 console.error('Error fetching data:', error);
@@ -173,7 +172,7 @@
         }
 
         // Update UI with fetched data
-        function updateUI(status, queueDist, sessionStats, serviceAccounts, rcloneStats) {
+        function updateUI(status, queueStatus, sessionStats, serviceAccounts, rcloneStats) {
             const isActive = status.active;
             
             document.getElementById('no-activity').classList.toggle('hidden', isActive);
@@ -189,7 +188,7 @@
 
                 // Update sections
                 updateCurrentTransfers(rcloneStats);
-                updateQueueDistribution(queueDist);
+                updateQueueStatus(queueStatus);
                 updateSessionStats(sessionStats);
                 updateServiceAccounts(serviceAccounts);
             }
@@ -228,68 +227,68 @@
             document.getElementById('overall-eta').textContent = rcloneStats.data.eta_human;
         }
 
-        // Update queue distribution section
-        function updateQueueDistribution(queueDist) {
-            const container = document.getElementById('queue-distribution');
+        // Update queue status section
+        function updateQueueStatus(queueStatus) {
+            const container = document.getElementById('queue-status');
             
-            if (!queueDist || !queueDist.available) {
+            if (!queueStatus || !queueStatus.available) {
                 container.innerHTML = '<p class="text-gray-400 text-sm">No queue data available</p>';
                 return;
             }
 
-            const data = queueDist.data;
-            const stats = data.statistics;
-            const percentiles = data.percentiles_human;
-            const buckets = data.size_buckets;
-            const confidence = data.metadata.confidence;
-
-            // Update confidence badge
-            const confidenceColors = {
-                'very_high': 'bg-green-600',
-                'high': 'bg-blue-600',
-                'medium': 'bg-yellow-600',
-                'low': 'bg-red-600'
-            };
-            document.getElementById('queue-confidence').textContent = confidence.replace('_', ' ');
-            document.getElementById('queue-confidence').className = `ml-2 text-xs px-2 py-1 rounded ${confidenceColors[confidence] || 'bg-gray-700'}`;
-
+            const data = queueStatus.data;
+            const params = data.stage_params || {};
+            const stats = data.queue_stats || {};
+            
+            // Checking progress
+            const totalChecks = stats.totalChecks || 0;
+            const checks = stats.checks || 0;
+            const checkPercent = totalChecks > 0 ? (checks / totalChecks * 100) : 100;
+            const isChecking = stats.checking_count > 0;
+            
             const html = `
-                <div class="space-y-3">
-                    <div class="grid grid-cols-2 gap-3 text-sm">
-                        <div class="bg-gray-700 p-3 rounded">
-                            <div class="text-gray-400">Total Files</div>
-                            <div class="text-xl font-bold">${stats.total_files.toLocaleString()}</div>
-                        </div>
-                        <div class="bg-gray-700 p-3 rounded">
-                            <div class="text-gray-400">Total Size</div>
-                            <div class="text-xl font-bold">${stats.total_bytes_human}</div>
+                <div class="space-y-4">
+                    <!-- Stage Parameters -->
+                    <div class="bg-gray-700 rounded p-3 text-sm">
+                        <div class="text-xs text-gray-400 uppercase tracking-wide mb-2">Current Stage Parameters</div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div><span class="text-gray-400">Strategy:</span> <span class="text-blue-300">${params.strategy}</span></div>
+                            <div><span class="text-gray-400">Max Transfer:</span> <span class="font-mono">${params.max_transfer}</span></div>
+                            <div><span class="text-gray-400">Max Size:</span> <span class="font-mono">${params.max_size}</span></div>
+                            <div><span class="text-gray-400">Transfers:</span> <span class="font-mono">${params.transfers}</span></div>
+                            <div><span class="text-gray-400">Order By:</span> <span class="font-mono text-xs">${params.order_by || 'None'}</span></div>
+                            <div><span class="text-gray-400">Backlog:</span> <span class="font-mono">${params.max_backlog || 'Default'}</span></div>
                         </div>
                     </div>
                     
-                    <div class="bg-gray-700 p-3 rounded">
-                        <div class="text-xs text-gray-400 mb-2">Percentiles</div>
-                        <div class="grid grid-cols-5 gap-2 text-xs">
-                            <div><span class="text-gray-400">P50:</span> <span class="font-mono">${percentiles.p50}</span></div>
-                            <div><span class="text-gray-400">P75:</span> <span class="font-mono">${percentiles.p75}</span></div>
-                            <div><span class="text-gray-400">P90:</span> <span class="font-mono">${percentiles.p90}</span></div>
-                            <div><span class="text-gray-400">P95:</span> <span class="font-mono">${percentiles.p95}</span></div>
-                            <div><span class="text-gray-400">P99:</span> <span class="font-mono">${percentiles.p99}</span></div>
-                        </div>
-                    </div>
-
+                    <!-- Queue Stats -->
                     <div>
-                        <div class="text-xs text-gray-400 mb-2">Size Distribution</div>
-                        ${Object.entries(buckets).map(([name, info]) => `
-                            <div class="mb-2">
-                                <div class="flex justify-between text-xs mb-1">
-                                    <span class="text-gray-300">${name}</span>
-                                    <span class="text-gray-400">${info.percentage.toFixed(1)}% (${info.count} files)</span>
-                                </div>
-                                <div class="w-full bg-gray-700 rounded-full h-2">
-                                    <div class="bg-purple-500 h-2 rounded-full progress-bar" style="width: ${info.percentage}%"></div>
-                                </div>
+                        <div class="flex justify-between text-sm mb-1">
+                            <span class="text-gray-400">Scanning Progress</span>
+                            <span class="font-mono text-xs">${checks.toLocaleString()} / ${totalChecks.toLocaleString()}</span>
+                        </div>
+                        <div class="w-full bg-gray-700 rounded-full h-2 mb-1">
+                            <div class="bg-purple-500 h-2 rounded-full progress-bar" style="width: ${checkPercent}%"></div>
+                        </div>
+                        <div class="text-xs text-gray-400 mb-3">${isChecking ? 'Checking in progress...' : 'Scan complete'}</div>
+                        
+                        ${stats.checking && stats.checking.length > 0 ? `
+                            <div class="text-xs text-gray-400 mb-2">Currently Checking (${stats.checking_count}):</div>
+                            <div class="bg-gray-900 rounded p-2 font-mono text-xs text-gray-500 overflow-hidden">
+                                ${stats.checking.map(f => `<div class="truncate">• ${f}</div>`).join('')}
                             </div>
-                        `).join('')}
+                        ` : ''}
+                        
+                        <div class="grid grid-cols-2 gap-3 mt-3 pt-3 border-t border-gray-700 text-sm">
+                            <div>
+                                <span class="text-gray-400 block text-xs">Transfer Queue</span>
+                                <span class="font-semibold text-lg">${(stats.totalTransfers || 0).toLocaleString()}</span>
+                            </div>
+                            <div>
+                                <span class="text-gray-400 block text-xs">Active Transfers</span>
+                                <span class="font-semibold text-lg text-green-400">${stats.transferring_count || 0}</span>
+                            </div>
+                        </div>
                     </div>
                 </div>
             `;

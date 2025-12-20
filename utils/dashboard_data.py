@@ -234,6 +234,40 @@ class DashboardDataProvider:
         
         return None
     
+    def get_queue_status(self):
+        """Get real-time queue status and stage parameters"""
+        result = {
+            'stage_params': {},
+            'queue_stats': {}
+        }
+        
+        # Get session state for stage parameters
+        session_state = self._load_session_state()
+        if session_state:
+            result['stage_params'] = session_state.get('stage_params', {})
+        
+        # Get live queue stats from RC API
+        if self.rc_url:
+            try:
+                response = requests.post(f"{self.rc_url}/core/stats", timeout=5)
+                if response.status_code == 200:
+                    stats = response.json()
+                    
+                    result['queue_stats'] = {
+                        'listed': stats.get('listed', 0),
+                        'checks': stats.get('checks', 0),
+                        'totalChecks': stats.get('totalChecks', 0),
+                        'checking': stats.get('checking', [])[:5],  # Limit to 5
+                        'checking_count': len(stats.get('checking', [])),
+                        'totalTransfers': stats.get('totalTransfers', 0),
+                        'transferring_count': len(stats.get('transferring', []))
+                    }
+            except Exception as e:
+                log.debug(f"Error getting queue status from RC: {e}")
+        
+        # Return result if we have any data, otherwise None
+        return result if (result['stage_params'] or result['queue_stats']) else None
+    
     def get_session_stats(self, uploader=None):
         """Get cumulative session statistics combining session state and live RC API data"""
         try:

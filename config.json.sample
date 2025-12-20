@@ -46,6 +46,7 @@
         "enabled": true,
         "host": "0.0.0.0",
         "port": 47949,
+        "rc_url": "http://localhost:5572",
         "refresh_interval": 3,
         "debug": false
     },

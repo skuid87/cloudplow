@@ -44,13 +44,16 @@ except Exception as e:
 # Get configuration
 dashboard_config = conf_data.get('dashboard', {})
 config_dir = os.path.dirname(config_file)
-rc_url = None
 
-# Try to get RC URL from plex config
-if 'plex' in conf_data and 'rclone' in conf_data['plex']:
-    rc_url = conf_data['plex']['rclone'].get('url')
+# Try to get RC URL from dashboard config first (preferred)
+rc_url = dashboard_config.get('rc_url')
 
-# Fallback to default RC URL if not configured
+# Fall back to plex config if not in dashboard config
+if not rc_url:
+    if 'plex' in conf_data and 'rclone' in conf_data['plex']:
+        rc_url = conf_data['plex']['rclone'].get('url')
+
+# Fallback to default RC URL if not configured anywhere
 if not rc_url:
     rc_url = 'http://localhost:5572'
 

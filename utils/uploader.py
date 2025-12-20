@@ -125,7 +125,7 @@ class RCStatsPoller(threading.Thread):
 
 
 class Uploader:
-    def __init__(self, name, uploader_config, rclone_config, rclone_binary_path, rclone_config_path, plex, dry_run, transfer_cache=None, json_log_path=None, rc_url=None):
+    def __init__(self, name, uploader_config, rclone_config, rclone_binary_path, rclone_config_path, plex, dry_run, transfer_cache=None, json_log_path=None, rc_url=None, quota_callback=None):
         self.name = name
         self.uploader_config = uploader_config
         self.rclone_config = rclone_config
@@ -144,6 +144,7 @@ class Uploader:
         self.rc_url = rc_url
         self.rc_poller = None
         self.json_logger = None
+        self.quota_callback = quota_callback  # Callback for real-time quota updates
         
         # Initialize JSONL logger with rotation if path provided
         if self.json_log_path:
@@ -340,6 +341,13 @@ class Uploader:
                 file_size = self._get_file_size(file_path)
                 if file_size > 0:
                     self.transferred_file_sizes[file_path] = file_size
+                    
+                    # Update quota cache in real-time (if callback provided)
+                    if self.quota_callback:
+                        try:
+                            self.quota_callback(file_size)
+                        except Exception as e:
+                            log.warning(f"Quota callback failed: {e}")
                 
                 # Log to JSONL with RC stats enrichment
                 self._log_completed_file(file_path)
@@ -553,7 +561,7 @@ class Uploader:
         except Exception as e:
             log.debug(f"Could not get file size for {file_path}: {e}")
             return 0
-    
+
     def get_transfer_statistics(self):
         """
         Get statistics about files transferred in this session

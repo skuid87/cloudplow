@@ -749,6 +749,11 @@ def do_upload(remote=None):
                                 else:
                                     dynamic_rclone_config['rclone_extras'].pop('--max-backlog', None)
                                 
+                                # Create quota update callback for real-time tracking
+                                def update_quota_realtime(bytes_delta):
+                                    """Called each time a file completes to update quota in real-time"""
+                                    update_sa_quota_usage(uploader_remote, sa_file, bytes_delta)
+                                
                                 # Create uploader with dynamic config for this stage
                                 stage_uploader = Uploader(
                                     uploader_remote,
@@ -760,7 +765,8 @@ def do_upload(remote=None):
                                     conf.configs['core']['dry_run'],
                                     transferred_files_cache,
                                     json_transfer_log,
-                                    rc_url
+                                    rc_url,
+                                    quota_callback=update_quota_realtime
                                 )
                                 stage_uploader.set_service_account(sa_file)
                                 
@@ -808,8 +814,8 @@ def do_upload(remote=None):
                                     bytes_delta=bytes_uploaded
                                 )
                                 
-                                # Update quota tracking
-                                update_sa_quota_usage(uploader_remote, sa_file, bytes_uploaded)
+                                # Refresh quota tracking (already updated in real-time per file)
+                                # Note: quota was updated via callback as each file completed
                                 sa_quota_remaining = get_sa_remaining_quota(uploader_remote, sa_file)
                                 sa_total_uploaded += bytes_uploaded
                                 

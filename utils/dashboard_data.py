@@ -104,54 +104,73 @@ class DashboardDataProvider:
     def get_service_accounts(self, uploader=None):
         """Get service account status and quota information"""
         try:
-            if not os.path.exists(self.sa_quota_cache_file):
-                return []
-            
-            with open(self.sa_quota_cache_file, 'r') as f:
-                quota_cache = json.load(f)
+            quota_cache = {}
+            if os.path.exists(self.sa_quota_cache_file):
+                with open(self.sa_quota_cache_file, 'r') as f:
+                    quota_cache = json.load(f)
             
             session_state = self._load_session_state()
             current_sa = session_state.get('current_sa', '') if session_state else ''
             current_uploader = session_state.get('uploader', '') if session_state else uploader
             
             result = []
+            quota_limit = 750 * 1024**3  # 750GB
             
-            if current_uploader and current_uploader in quota_cache:
-                sa_data = quota_cache[current_uploader]
+            # Get SA data for this uploader
+            sa_data = quota_cache.get(current_uploader, {}) if current_uploader else {}
+            
+            # Add all SAs from quota cache
+            for sa_file, info in sa_data.items():
+                used_bytes = info.get('bytes', 0)
+                reset_time = info.get('reset_time', 0)
                 
-                for sa_file, info in sa_data.items():
-                    used_bytes = info.get('bytes', 0)
-                    reset_time = info.get('reset_time', 0)
-                    quota_limit = 750 * 1024**3  # 750GB
-                    
-                    # Determine status
-                    if os.path.basename(sa_file) == os.path.basename(current_sa):
-                        status = 'active'
-                    elif used_bytes >= quota_limit * 0.95:
-                        status = 'complete'
-                    else:
-                        status = 'ready'
-                    
-                    # Calculate time until reset
-                    if reset_time > time.time():
-                        seconds_until_reset = int(reset_time - time.time())
-                        hours = seconds_until_reset // 3600
-                        minutes = (seconds_until_reset % 3600) // 60
-                        reset_in = f"{hours}h {minutes}m"
-                    else:
-                        reset_in = "Ready"
-                    
+                # Determine status
+                if os.path.basename(sa_file) == current_sa:
+                    status = 'active'
+                elif used_bytes >= quota_limit * 0.95:
+                    status = 'complete'
+                else:
+                    status = 'ready'
+                
+                # Calculate time until reset
+                if reset_time > time.time():
+                    seconds_until_reset = int(reset_time - time.time())
+                    hours = seconds_until_reset // 3600
+                    minutes = (seconds_until_reset % 3600) // 60
+                    reset_in = f"{hours}h {minutes}m"
+                else:
+                    reset_in = "Ready"
+                
+                result.append({
+                    'sa_file': os.path.basename(sa_file),
+                    'sa_file_full': sa_file,
+                    'status': status,
+                    'used_bytes': used_bytes,
+                    'quota_bytes': quota_limit,
+                    'used_gb': round(used_bytes / 1024**3, 1),
+                    'quota_gb': 750,
+                    'percentage': round((used_bytes / quota_limit) * 100, 1),
+                    'reset_time': reset_time,
+                    'reset_in': reset_in
+                })
+            
+            # IMPORTANT: If current SA is not in cache yet, add it with 0 usage
+            # This happens when SA just started and no files have completed yet
+            if current_sa and session_state and session_state.get('active'):
+                sa_in_results = any(r['sa_file'] == current_sa for r in result)
+                if not sa_in_results:
+                    # Current SA is active but not yet in quota cache
                     result.append({
-                        'sa_file': os.path.basename(sa_file),
-                        'sa_file_full': sa_file,
-                        'status': status,
-                        'used_bytes': used_bytes,
+                        'sa_file': current_sa,
+                        'sa_file_full': current_sa,
+                        'status': 'active',
+                        'used_bytes': 0,
                         'quota_bytes': quota_limit,
-                        'used_gb': round(used_bytes / 1024**3, 1),
+                        'used_gb': 0.0,
                         'quota_gb': 750,
-                        'percentage': round((used_bytes / quota_limit) * 100, 1),
-                        'reset_time': reset_time,
-                        'reset_in': reset_in
+                        'percentage': 0.0,
+                        'reset_time': 0,
+                        'reset_in': 'Ready'
                     })
             
             return sorted(result, key=lambda x: x['sa_file'])

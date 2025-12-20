@@ -223,24 +223,11 @@ class DashboardDataProvider:
             if not session_state:
                 return None
             
-            # Get queue distribution to calculate totals
-            queue_dist = self.get_queue_distribution(uploader or session_state.get('uploader'))
-            transfer_history = self.get_transfer_history(uploader or session_state.get('uploader'))
-            
-            total_files = 0
-            total_bytes = 0
-            transferred_files = 0
-            transferred_bytes = 0
-            
-            if queue_dist:
-                if isinstance(queue_dist, dict) and 'statistics' in queue_dist:
-                    total_files = queue_dist['statistics'].get('total_files', 0)
-                    total_bytes = queue_dist['statistics'].get('total_bytes', 0)
-            
-            if transfer_history:
-                if isinstance(transfer_history, dict) and 'statistics' in transfer_history:
-                    transferred_files = transfer_history['statistics'].get('total_files', 0)
-                    transferred_bytes = transfer_history['statistics'].get('total_bytes', 0)
+            # Get totals directly from session state (populated from RC API)
+            total_files = session_state.get('total_files', 0)
+            total_bytes = session_state.get('total_bytes', 0)
+            transferred_files = session_state.get('transferred_files', 0)
+            transferred_bytes = session_state.get('transferred_bytes', 0)
             
             # Calculate session duration
             session_start = session_state.get('session_start_time', time.time())

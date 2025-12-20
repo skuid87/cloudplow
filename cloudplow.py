@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 from multiprocessing import Process
 
 import schedule
+import requests
 
 from utils import config, lock, path, decorators, version, misc
 from utils.cache import Cache
@@ -706,6 +707,7 @@ def do_upload(remote=None):
                             resp_trigger = ""
                             resp_success = False
                             session_start_time = time.time()
+                            totals_captured = False  # Track if we've captured total files/bytes
                             
                             while sa_quota_remaining > 10 * 1024**3:  # Continue while >10GB remains
                                 from utils.distribution import format_bytes
@@ -779,6 +781,32 @@ def do_upload(remote=None):
                                 resp_success = resp['success']
                                 transfer_count = resp['transfer_count']
                                 bytes_uploaded = resp['total_bytes']
+                                
+                                # Try to capture total files from RC API (only once, after first stage)
+                                # Use the "listed" field which shows files found during scan
+                                if not totals_captured and rc_url:
+                                    try:
+                                        response = requests.post(f"{rc_url}/core/stats", timeout=5)
+                                        if response.status_code == 200:
+                                            stats = response.json()
+                                            # "listed" shows total files found during rclone's initial scan
+                                            total_files = stats.get('listed', 0)
+                                            # totalBytes shows the total size of all files to transfer
+                                            total_bytes = stats.get('totalBytes', 0)
+                                            
+                                            # If we have meaningful totals, update session
+                                            if total_files > 0:
+                                                session_tracker.set_totals(total_files, total_bytes)
+                                                totals_captured = True
+                                                log.info(f"Captured session totals from RC: {total_files} files, {format_bytes(total_bytes)}")
+                                    except Exception as e:
+                                        log.debug(f"Could not capture totals from RC API: {e}")
+                                
+                                # Update dashboard session with stage progress
+                                session_tracker.update_transferred(
+                                    files_delta=transfer_count,
+                                    bytes_delta=bytes_uploaded
+                                )
                                 
                                 # Update quota tracking
                                 update_sa_quota_usage(uploader_remote, sa_file, bytes_uploaded)

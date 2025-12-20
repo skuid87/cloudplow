@@ -32,7 +32,11 @@ class SessionStateTracker:
             'session_start': time.strftime('%Y-%m-%d %H:%M:%S'),
             'session_start_time': time.time(),
             'upload_folder': upload_folder,
-            'sas_used': []
+            'sas_used': [],
+            'total_files': 0,
+            'total_bytes': 0,
+            'transferred_files': 0,
+            'transferred_bytes': 0
         }
         self._save()
         log.info(f"Started dashboard session for {uploader}")
@@ -66,6 +70,37 @@ class SessionStateTracker:
         
         self._save()
         log.debug(f"Updated stage: {stage_number}")
+    
+    def set_totals(self, total_files, total_bytes):
+        """Set total files and bytes to transfer (from rclone scan)"""
+        if not self.session_data.get('active'):
+            return
+        
+        self.session_data['total_files'] = total_files
+        self.session_data['total_bytes'] = total_bytes
+        
+        self._save()
+        log.info(f"Set session totals: {total_files} files, {total_bytes} bytes")
+    
+    def update_transferred(self, files_delta, bytes_delta):
+        """Update cumulative transferred files and bytes"""
+        if not self.session_data.get('active'):
+            return
+        
+        # Initialize if not present
+        if 'transferred_files' not in self.session_data:
+            self.session_data['transferred_files'] = 0
+        if 'transferred_bytes' not in self.session_data:
+            self.session_data['transferred_bytes'] = 0
+        
+        # Add deltas
+        self.session_data['transferred_files'] += files_delta
+        self.session_data['transferred_bytes'] += bytes_delta
+        
+        self._save()
+        log.debug(f"Updated transferred: +{files_delta} files, +{bytes_delta} bytes "
+                 f"(total: {self.session_data['transferred_files']} files, "
+                 f"{self.session_data['transferred_bytes']} bytes)")
     
     def end_session(self):
         """Mark session as ended"""

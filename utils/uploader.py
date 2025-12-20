@@ -145,6 +145,9 @@ class Uploader:
         self.rc_poller = None
         self.json_logger = None
         self.quota_callback = quota_callback  # Callback for real-time quota updates
+        self.max_transfer_detected = False  # Flag for early termination
+        self.max_transfer_detect_time = None  # Time when max-transfer was first detected
+        self.early_terminated = False  # Flag to indicate we terminated early due to max-transfer
         
         # Initialize JSONL logger with rotation if path provided
         if self.json_log_path:
@@ -207,6 +210,41 @@ class Uploader:
                 self.rc_poller = None
             except Exception as e:
                 log.warning(f"Error stopping RC polling: {e}")
+    
+    def _verify_transfers_stopped(self):
+        """Verify no active transfers via RC API to confirm safe early termination"""
+        if not self.rc_url:
+            # No RC API available, can't verify - assume it's safe after 5 seconds
+            return True
+        
+        try:
+            import requests
+            response = requests.post(f"{self.rc_url}/core/stats", timeout=5)
+            if response.status_code == 200:
+                stats = response.json()
+                
+                # Check conditions for safe early termination:
+                # 1. No files currently transferring
+                # 2. Speed is 0 (confirms nothing uploading)
+                # 3. Still checking files (confirms we're wasting time)
+                transferring_count = len(stats.get('transferring', []))
+                speed = stats.get('speed', 0)
+                checking_count = len(stats.get('checking', []))
+                
+                is_safe = (transferring_count == 0 and speed == 0 and checking_count > 0)
+                
+                if is_safe:
+                    log.debug(f"Verified safe for early termination: {checking_count} files still checking, 0 transferring")
+                else:
+                    log.debug(f"Not yet safe for termination: transferring={transferring_count}, speed={speed}, checking={checking_count}")
+                
+                return is_safe
+        except Exception as e:
+            log.debug(f"Could not verify transfers stopped via RC API: {e}")
+            # If we can't verify, wait longer - return False
+            return False
+        
+        return False
 
     def upload(self):
         # Track upload start time for metrics
@@ -254,12 +292,21 @@ class Uploader:
             log.info(f"Uploading '{rclone_config['upload_folder']}' to remote: {self.name}")
             self.delayed_check = 0
             self.trigger_tracks = {}
+            self.early_terminated = False  # Reset flag
             success = False
             upload_status, return_code = rclone.upload(self.__logic)
 
             log.debug("return_code is: %s", return_code)
 
-            if return_code == 7:
+            # Handle early termination (process killed after max-transfer detection)
+            if self.early_terminated:
+                success = True
+                log.info("Early termination successful - max-transfer reached, moved to next stage immediately")
+                # Treat as max-transfer success (code 7 equivalent)
+                self.delayed_check = 0
+                # return_code will be negative (killed), but we treat it as success
+
+            elif return_code == 7:
                 success = True
                 log.info("Received 'Max Transfer Reached' signal from Rclone.")
                 self.delayed_trigger = "Rclone's 'Max Transfer Reached' signal"
@@ -330,6 +377,23 @@ class Uploader:
         )
 
     def __logic(self, data):
+        # Early termination: Detect max-transfer and kill rclone to avoid wasting time checking
+        if "max transfer limit reached" in data.lower():
+            if not self.max_transfer_detected:
+                self.max_transfer_detected = True
+                self.max_transfer_detect_time = time.time()
+                log.info("Max-transfer limit detected - will verify and terminate early to save time")
+            
+            # Give it 5 seconds after first detection to ensure transfers complete
+            if time.time() - self.max_transfer_detect_time >= 5:
+                if self._verify_transfers_stopped():
+                    log.info("Early termination: Transfers stopped, still checking files - terminating to start next stage")
+                    # Set flag and trigger info
+                    self.early_terminated = True
+                    self.delayed_check = 0
+                    self.delayed_trigger = "Early termination after max-transfer"
+                    return True  # Terminate rclone process
+        
         # Capture successful transfers from rclone output
         if ': Copied (' in data:
             file_path = self._extract_filepath_from_rclone_output(data)

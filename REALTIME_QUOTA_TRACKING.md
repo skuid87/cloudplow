@@ -123,10 +123,35 @@ curl http://localhost:47949/api/service_accounts | jq
 # 6. Restart upload - strategy should reflect actual remaining capacity
 ```
 
+## Session Statistics Enhancement
+
+In addition to real-time quota tracking, the dashboard's **Session Statistics** section was enhanced to show live progress data.
+
+### Problem
+Session statistics (Avg Speed, Remaining, ETA) were showing zeros because:
+- `total_files` and `total_bytes` were only captured after first stage completed
+- `transferred_files` and `transferred_bytes` were only updated after each stage
+- No live data from current transfers
+
+### Solution
+Modified `get_session_stats()` in `utils/dashboard_data.py` to:
+1. Pull **live stats from RC API** for current stage (`bytes`, `speed`, `eta`, `totalBytes`)
+2. Combine with **cumulative data from session state** (previous stages/SAs)
+3. Use RC API totals as fallback if session state totals aren't set yet
+
+### Result
+Dashboard now shows:
+- ✅ **Live progress** during transfers (27GB / 419GB)
+- ✅ **Real-time speed** (91 MB/s)
+- ✅ **Accurate ETA** from rclone (71 minutes)
+- ✅ **Remaining bytes** calculated correctly
+- ✅ **Works immediately** - no need to wait for stage completion
+
 ## Related Files
 
 - `utils/uploader.py` - Uploader class with quota callback
 - `cloudplow.py` - Creates callback and passes to uploader
-- `utils/dashboard_data.py` - Dashboard data provider
+- `utils/dashboard_data.py` - Dashboard data provider (quota + session stats)
 - `sa_quota_cache.json` - Persistent quota cache file
+- `dashboard_session_state.json` - Session state for dashboard
 

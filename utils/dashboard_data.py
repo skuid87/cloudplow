@@ -235,29 +235,62 @@ class DashboardDataProvider:
         return None
     
     def get_session_stats(self, uploader=None):
-        """Get cumulative session statistics"""
+        """Get cumulative session statistics combining session state and live RC API data"""
         try:
             session_state = self._load_session_state()
             
             if not session_state:
                 return None
             
-            # Get totals directly from session state (populated from RC API)
+            # Get cumulative data from session state (across all stages/SAs)
+            session_transferred_files = session_state.get('transferred_files', 0)
+            session_transferred_bytes = session_state.get('transferred_bytes', 0)
+            
+            # Try to get LIVE stats from RC API for current stage
+            current_bytes = 0
+            current_speed = 0
+            current_eta = 0
             total_files = session_state.get('total_files', 0)
             total_bytes = session_state.get('total_bytes', 0)
-            transferred_files = session_state.get('transferred_files', 0)
-            transferred_bytes = session_state.get('transferred_bytes', 0)
+            
+            if self.rc_url:
+                try:
+                    response = requests.post(f"{self.rc_url}/core/stats", timeout=5)
+                    if response.status_code == 200:
+                        stats = response.json()
+                        # Get current stage stats
+                        current_bytes = stats.get('bytes', 0)
+                        current_speed = stats.get('speed', 0)
+                        current_eta = stats.get('eta', 0) or 0
+                        
+                        # If session state doesn't have totals yet, use RC API totals
+                        if total_bytes == 0:
+                            total_bytes = stats.get('totalBytes', 0)
+                        if total_files == 0:
+                            # Use totalTransfers + totalChecks as approximation
+                            total_files = stats.get('totalTransfers', 0) + stats.get('totalChecks', 0)
+                except Exception as e:
+                    log.debug(f"Could not get RC stats for session stats: {e}")
+            
+            # Combine cumulative (from previous stages) + current (from RC API)
+            transferred_bytes = session_transferred_bytes + current_bytes
+            transferred_files = session_transferred_files  # Files completed (not current)
             
             # Calculate session duration
             session_start = session_state.get('session_start_time', time.time())
             duration_seconds = int(time.time() - session_start)
             
-            # Calculate average speed
+            # Calculate average speed (total transferred / total time)
             avg_speed = transferred_bytes / duration_seconds if duration_seconds > 0 else 0
             
-            # Calculate ETA
+            # Calculate remaining
             remaining_bytes = max(0, total_bytes - transferred_bytes)
-            eta_seconds = int(remaining_bytes / avg_speed) if avg_speed > 0 else 0
+            
+            # Use RC API's ETA if available, otherwise calculate from avg speed
+            if current_eta > 0:
+                eta_seconds = current_eta
+            else:
+                eta_seconds = int(remaining_bytes / avg_speed) if avg_speed > 0 else 0
             
             # Calculate percentages
             file_percentage = (transferred_files / total_files * 100) if total_files > 0 else 0

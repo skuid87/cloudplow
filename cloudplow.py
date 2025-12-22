@@ -706,22 +706,15 @@ def do_upload(remote=None):
                             is_weekend = datetime.datetime.now().weekday() in [5, 6]
                             if not is_weekend and transferred_files_cache is not None:
                                 try:
-                                    # Load cached files from the cache database
-                                    import sqlite3
-                                    if os.path.exists(transferred_files_cache):
-                                        conn = sqlite3.connect(transferred_files_cache)
-                                        cursor = conn.cursor()
-                                        # Get cached files for this uploader
-                                        cursor.execute(
-                                            "SELECT file_path FROM transferred_files WHERE uploader_name = ?",
-                                            (uploader_remote,)
-                                        )
-                                        cached_files = [row[0] for row in cursor.fetchall()]
-                                        conn.close()
-                                        
-                                        if cached_files:
-                                            log.info(f"Weekday run - adding {len(cached_files)} cached files to excludes for file list generation")
-                                            excludes_for_chunking.extend(cached_files)
+                                    # Load cached files from the cache dictionary
+                                    cache_data = transferred_files_cache.get(uploader_remote, {})
+                                    cached_files = cache_data.get('files', [])
+                                    
+                                    if cached_files:
+                                        log.info(f"Weekday run - adding {len(cached_files)} cached files to excludes for file list generation")
+                                        excludes_for_chunking.extend(cached_files)
+                                    else:
+                                        log.debug(f"No cached files found for {uploader_remote}")
                                 except Exception as e:
                                     log.warning(f"Failed to load cached files for chunking: {e}")
                             elif is_weekend:

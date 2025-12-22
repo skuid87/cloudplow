@@ -285,16 +285,19 @@ class RcloneUploader:
             if files_from:
                 cmd += f' --files-from={cmd_quote(files_from)}'
                 log.info(f"Uploading files from batch list: {os.path.basename(files_from)}")
-            
-            # Use exclude file if there are many excludes (>100) to avoid "Argument list too long" error
-            if 'rclone_excludes' in self.config and len(self.config['rclone_excludes']) > 100:
-                exclude_file = self.__create_exclude_file()
-                cmd += f' --exclude-from={cmd_quote(exclude_file)}'
-                log.info(f"Using exclude file with {len(self.config['rclone_excludes'])} entries")
+                # Skip excludes when using --files-from (rclone doesn't allow combining them)
+                # Excludes should have been applied during file list generation
+                log.debug("Skipping excludes (already applied during file list generation)")
             else:
-                excludes = self.__excludes2string()
-                if len(excludes) > 2:
-                    cmd += f' {excludes}'
+                # Use exclude file if there are many excludes (>100) to avoid "Argument list too long" error
+                if 'rclone_excludes' in self.config and len(self.config['rclone_excludes']) > 100:
+                    exclude_file = self.__create_exclude_file()
+                    cmd += f' --exclude-from={cmd_quote(exclude_file)}'
+                    log.info(f"Using exclude file with {len(self.config['rclone_excludes'])} entries")
+                else:
+                    excludes = self.__excludes2string()
+                    if len(excludes) > 2:
+                        cmd += f' {excludes}'
             
             if self.plex.get('enabled'):
                 r = re.compile(r"https?://(www\.)?")

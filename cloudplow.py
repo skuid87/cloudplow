@@ -888,12 +888,17 @@ def do_upload(remote=None):
                                             break
                                     
                                     # Create combined response from all chunks
+                                    upload_duration = time.time() - upload_start_time
                                     resp = {
                                         'success': True,
                                         'transfer_count': total_chunk_transfers,
                                         'total_bytes': total_chunk_bytes,
                                         'delayed_check': 0,
-                                        'delayed_trigger': ''
+                                        'delayed_trigger': '',
+                                        'duration_seconds': upload_duration,
+                                        'avg_speed_bytes': total_chunk_bytes / upload_duration if upload_duration > 0 else 0,
+                                        'is_weekend': stage_uploader.is_weekend,
+                                        'cached_files_excluded': 0  # Chunk uploads don't use cache excludes in the same way
                                     }
                                     
                                     log.info(f"=== All chunks completed: {total_chunk_transfers} files, {format_bytes(total_chunk_bytes)} ===")

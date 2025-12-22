@@ -99,6 +99,11 @@
             "check_interval": 30,
             "exclude_open_files": true,
             "max_size_gb": 200,
+            "chunked_upload": {
+                "enabled": false,
+                "chunk_size": 1000,
+                "generate_list_timeout": 600
+            },
             "opened_excludes": [
                 "/downloads/"
             ],

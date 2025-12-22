@@ -683,6 +683,47 @@ def do_upload(remote=None):
                             upload_folder=rclone_config['upload_folder']
                         )
                         
+                        # Check if chunked upload is enabled
+                        chunked_config = uploader_config.get('chunked_upload', {})
+                        use_chunking = chunked_config.get('enabled', False)
+                        chunks = []
+                        list_file = None
+                        total_files_from_list = 0
+                        
+                        if use_chunking:
+                            from utils.chunker import FileChunker
+                            
+                            chunk_size = chunked_config.get('chunk_size', 1000)
+                            list_timeout = chunked_config.get('generate_list_timeout', 600)
+                            
+                            log.info(f"Chunked upload enabled (chunk_size={chunk_size}) - generating file list for {rclone_config['upload_folder']}")
+                            chunker = FileChunker(
+                                conf.configs['core']['rclone_binary_path'],
+                                conf.configs['core']['rclone_config_path'],
+                                rclone_config['upload_folder'],
+                                rclone_config.get('rclone_excludes', []),
+                                timeout=list_timeout
+                            )
+                            
+                            result = chunker.generate_file_list()
+                            if not result:
+                                log.error("Failed to generate file list - falling back to normal upload")
+                                use_chunking = False
+                            else:
+                                list_file, total_files_from_list = result
+                                chunks = chunker.create_chunks(list_file, chunk_size)
+                                
+                                if not chunks:
+                                    log.error("Failed to create chunks - falling back to normal upload")
+                                    use_chunking = False
+                                    if list_file and os.path.exists(list_file):
+                                        os.remove(list_file)
+                                        list_file = None
+                                else:
+                                    log.info(f"Created {len(chunks)} chunks from {total_files_from_list:,} files")
+                                    # Set totals in session tracker immediately
+                                    session_tracker.set_totals(total_files_from_list, 0)  # Size unknown until upload
+                        
                         for i in range(available_accounts_size):
                             sa_file = available_accounts[i]
                             sa_start_time = time.time()
@@ -764,7 +805,6 @@ def do_upload(remote=None):
                                     """Called each time a file completes to update quota in real-time"""
                                     update_sa_quota_usage(uploader_remote, sa_file, bytes_delta)
                                     session_tracker.update_transferred_realtime(bytes_delta)
-                                    session_tracker.update_transferred_realtime(bytes_delta)
                                 
                                 # Create uploader with dynamic config for this stage
                                 stage_uploader = Uploader(
@@ -811,8 +851,52 @@ def do_upload(remote=None):
                                     except Exception as e:
                                         log.debug(f"Could not capture totals from RC API: {e}")
                                 
-                                # Run this stage
-                                resp = stage_uploader.upload()
+                                # Run this stage (with chunks if enabled)
+                                if use_chunking and stage_number == 1:
+                                    # Chunked upload: upload each chunk separately
+                                    log.info(f"=== Starting chunked upload: {len(chunks)} chunks ===")
+                                    total_chunk_transfers = 0
+                                    total_chunk_bytes = 0
+                                    
+                                    for chunk_idx, (chunk_file, chunk_file_count) in enumerate(chunks, 1):
+                                        log.info(f"=== Uploading chunk {chunk_idx}/{len(chunks)} ({chunk_file_count} files) ===")
+                                        
+                                        # Upload this chunk
+                                        chunk_resp = stage_uploader.upload(files_from=chunk_file)
+                                        
+                                        if not chunk_resp['success']:
+                                            log.error(f"Chunk {chunk_idx} failed: {chunk_resp.get('delayed_trigger', 'Unknown error')}")
+                                            # Set the response to the failed chunk response and break
+                                            resp = chunk_resp
+                                            break
+                                        
+                                        # Accumulate chunk results
+                                        total_chunk_transfers += chunk_resp['transfer_count']
+                                        total_chunk_bytes += chunk_resp['total_bytes']
+                                        
+                                        log.info(f"Chunk {chunk_idx}/{len(chunks)} completed: "
+                                                f"{chunk_resp['transfer_count']} files, "
+                                                f"{format_bytes(chunk_resp['total_bytes'])}")
+                                        
+                                        # Check if SA quota is exhausted, need to rotate
+                                        sa_quota_remaining = get_sa_remaining_quota(uploader_remote, sa_file)
+                                        if sa_quota_remaining < 10 * 1024**3:  # Less than 10GB
+                                            log.info(f"SA quota low ({format_bytes(sa_quota_remaining)}), stopping chunk loop to rotate SA")
+                                            break
+                                    
+                                    # Create combined response from all chunks
+                                    resp = {
+                                        'success': True,
+                                        'transfer_count': total_chunk_transfers,
+                                        'total_bytes': total_chunk_bytes,
+                                        'delayed_check': 0,
+                                        'delayed_trigger': ''
+                                    }
+                                    
+                                    log.info(f"=== All chunks completed: {total_chunk_transfers} files, {format_bytes(total_chunk_bytes)} ===")
+                                else:
+                                    # Normal upload (no chunking or not stage 1)
+                                    resp = stage_uploader.upload()
                                 
                                 # Process upload response
                                 resp_delay = resp['delayed_check']
@@ -1084,6 +1168,14 @@ def do_upload(remote=None):
                         if uploader_remote in uploader_delay and uploader_delay.pop(uploader_remote, None) is not None:
                             # this uploader was in the delay dict, but upload was successful, lets remove it
                             log.info(f"{uploader_remote} is no longer suspended due to a previous aborted upload!")
+                        
+                        # Cleanup chunk files if chunking was used
+                        if use_chunking and chunks:
+                            from utils.chunker import FileChunker
+                            FileChunker.cleanup_chunk_files(chunks)
+                            if list_file and os.path.exists(list_file):
+                                os.remove(list_file)
+                                log.info("Cleaned up chunked upload temporary files")
                         
                         # End dashboard session after all SAs complete
                         session_tracker.end_session()

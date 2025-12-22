@@ -246,7 +246,7 @@ class Uploader:
         
         return False
 
-    def upload(self):
+    def upload(self, files_from=None):
         # Track upload start time for metrics
         upload_start_time = time.time()
         
@@ -289,12 +289,15 @@ class Uploader:
                 rclone = RcloneUploader(self.name, rclone_config, self.rclone_binary_path, self.rclone_config_path,
                                         self.plex, self.dry_run)
 
-            log.info(f"Uploading '{rclone_config['upload_folder']}' to remote: {self.name}")
+            if files_from:
+                log.info(f"Uploading batch from '{os.path.basename(files_from)}' to remote: {self.name}")
+            else:
+                log.info(f"Uploading '{rclone_config['upload_folder']}' to remote: {self.name}")
             self.delayed_check = 0
             self.trigger_tracks = {}
             self.early_terminated = False  # Reset flag
             success = False
-            upload_status, return_code = rclone.upload(self.__logic)
+            upload_status, return_code = rclone.upload(self.__logic, files_from=files_from)
 
             log.debug("return_code is: %s", return_code)
 

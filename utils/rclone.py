@@ -178,10 +178,12 @@ class RcloneUploader:
 
         return False
 
-    def upload(self, callback):
+    def upload(self, callback, files_from=None):
         exclude_file = None
         try:
             log.debug(f"Uploading '{self.config['upload_folder']}' to '{self.config['upload_remote']}'")
+            if files_from:
+                log.debug(f"Using --files-from: {files_from}")
             log.debug(f"Rclone command set to '{self.config['rclone_command'] if ('rclone_command' in self.config and self.config['rclone_command'].lower() != 'sync') else 'move'}'")
             # build cmd
             cmd = f"{cmd_quote(self.rclone_binary_path)} {cmd_quote(self.config['rclone_command'] if ('rclone_command' in self.config and self.config['rclone_command'].lower() != 'sync') else 'move')} {cmd_quote(self.config['upload_folder'])} {cmd_quote(self.config['upload_remote'])} --config={cmd_quote(self.rclone_config_path)}"
@@ -278,6 +280,11 @@ class RcloneUploader:
             extras = self.__extras2string()
             if len(extras) > 2:
                 cmd += f' {extras}'
+            
+            # Add --files-from if provided (for chunked uploads)
+            if files_from:
+                cmd += f' --files-from={cmd_quote(files_from)}'
+                log.info(f"Uploading files from batch list: {os.path.basename(files_from)}")
             
             # Use exclude file if there are many excludes (>100) to avoid "Argument list too long" error
             if 'rclone_excludes' in self.config and len(self.config['rclone_excludes']) > 100:

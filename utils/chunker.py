@@ -20,7 +20,7 @@ log = logging.getLogger('chunker')
 class FileChunker:
     """Handles generating and chunking file lists for batched uploads"""
     
-    def __init__(self, rclone_binary_path, rclone_config_path, source_path, rclone_excludes=None, timeout=600):
+    def __init__(self, rclone_binary_path, rclone_config_path, source_path, rclone_excludes=None, rclone_extras=None, timeout=600):
         """
         Initialize FileChunker
         
@@ -29,12 +29,14 @@ class FileChunker:
             rclone_config_path: Path to rclone config file
             source_path: Local path to scan for files
             rclone_excludes: List of exclude patterns
+            rclone_extras: Dict of extra rclone flags to apply during file list generation
             timeout: Timeout in seconds for file list generation
         """
         self.rclone_binary_path = rclone_binary_path
         self.rclone_config_path = rclone_config_path
         self.source_path = source_path
         self.rclone_excludes = rclone_excludes or []
+        self.rclone_extras = rclone_extras or {}
         self.timeout = timeout
         
     def generate_file_list(self):
@@ -62,6 +64,19 @@ class FileChunker:
                 '--files-only',  # Skip directories
                 f'--config={self.rclone_config_path}'
             ]
+            
+            # Add filter flags from rclone_extras (apply filters during file list generation)
+            # These flags will be removed from the upload command to avoid conflicts with --files-from
+            filter_flags = ['--min-age', '--max-age', '--skip-links']
+            for flag in filter_flags:
+                if flag in self.rclone_extras:
+                    value = self.rclone_extras[flag]
+                    if value is None:
+                        cmd.append(flag)
+                    else:
+                        cmd.append(flag)
+                        cmd.append(str(value))
+                    log.debug(f"Applying filter flag during file list generation: {flag}")
             
             # Add excludes - use exclude file if there are many (>100)
             if len(self.rclone_excludes) > 100:

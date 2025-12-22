@@ -746,6 +746,7 @@ def do_upload(remote=None):
                                 conf.configs['core']['rclone_config_path'],
                                 rclone_config['upload_folder'],
                                 excludes_for_chunking,
+                                rclone_config.get('rclone_extras', {}),
                                 timeout=list_timeout
                             )
                             
@@ -849,6 +850,22 @@ def do_upload(remote=None):
                                     """Called each time a file completes to update quota in real-time"""
                                     update_sa_quota_usage(uploader_remote, sa_file, bytes_delta)
                                     session_tracker.update_transferred_realtime(bytes_delta)
+                                
+                                # For chunked uploads, remove flags incompatible with --files-from
+                                if use_chunking:
+                                    # Remove filter flags (they were applied during file list generation)
+                                    filter_flags_to_remove = ['--min-age', '--max-age', '--skip-links']
+                                    for flag in filter_flags_to_remove:
+                                        if flag in dynamic_rclone_config['rclone_extras']:
+                                            dynamic_rclone_config['rclone_extras'].pop(flag)
+                                            log.debug(f"Removed {flag} for chunked upload (applied during file list generation)")
+                                    
+                                    # Remove flags that conflict with --files-from
+                                    conflicting_flags = ['--order-by', '--max-backlog']
+                                    for flag in conflicting_flags:
+                                        if flag in dynamic_rclone_config['rclone_extras']:
+                                            dynamic_rclone_config['rclone_extras'].pop(flag)
+                                            log.debug(f"Removed {flag} for chunked upload (incompatible with --files-from)")
                                 
                                 # Create uploader with dynamic config for this stage
                                 stage_uploader = Uploader(

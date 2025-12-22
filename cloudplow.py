@@ -622,6 +622,12 @@ def do_upload(remote=None):
                     else:
                         plex_monitor_thread = thread.start(do_plex_monitor, 'plex-monitor')
 
+                # Initialize chunking variables (used later for cleanup)
+                use_chunking = False
+                chunks = []
+                list_file = None
+                total_files_from_list = 0
+                
                 # pause the nzbget queue before starting the upload, if enabled
                 if conf.configs['nzbget']['enabled']:
                     nzbget = Nzbget(conf.configs['nzbget']['url'])
@@ -686,9 +692,6 @@ def do_upload(remote=None):
                         # Check if chunked upload is enabled
                         chunked_config = uploader_config.get('chunked_upload', {})
                         use_chunking = chunked_config.get('enabled', False)
-                        chunks = []
-                        list_file = None
-                        total_files_from_list = 0
                         
                         if use_chunking:
                             from utils.chunker import FileChunker

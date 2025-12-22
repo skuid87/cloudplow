@@ -44,6 +44,8 @@ class FileChunker:
         Returns:
             Tuple of (list_file_path, file_count) or None on error
         """
+        exclude_file = None
+        list_file = None
         try:
             log.info(f"Generating file list for {self.source_path}...")
             
@@ -61,9 +63,23 @@ class FileChunker:
                 f'--config={self.rclone_config_path}'
             ]
             
-            # Add excludes
-            for exclude in self.rclone_excludes:
-                cmd.append(f'--exclude={exclude}')
+            # Add excludes - use exclude file if there are many (>100)
+            if len(self.rclone_excludes) > 100:
+                # Create temporary exclude file
+                fd_excl, exclude_file = tempfile.mkstemp(
+                    prefix='cloudplow_lsf_exclude_',
+                    suffix='.txt'
+                )
+                with os.fdopen(fd_excl, 'w') as f:
+                    for pattern in self.rclone_excludes:
+                        f.write(f"{pattern}\n")
+                
+                cmd.append(f'--exclude-from={exclude_file}')
+                log.info(f"Using exclude file with {len(self.rclone_excludes)} patterns for file list generation")
+            else:
+                # Use individual --exclude flags for small lists
+                for exclude in self.rclone_excludes:
+                    cmd.append(f'--exclude={exclude}')
             
             log.debug(f"Running: {' '.join(cmd)}")
             
@@ -77,9 +93,16 @@ class FileChunker:
                     text=True
                 )
             
+            # Clean up exclude file if it was created
+            if exclude_file and os.path.exists(exclude_file):
+                os.remove(exclude_file)
+                log.debug(f"Cleaned up exclude file: {exclude_file}")
+                exclude_file = None
+            
             if result.returncode != 0:
                 log.error(f"Failed to generate file list: {result.stderr}")
-                os.remove(list_file)
+                if list_file and os.path.exists(list_file):
+                    os.remove(list_file)
                 return None
             
             # Count files
@@ -88,7 +111,8 @@ class FileChunker:
             
             if file_count == 0:
                 log.warning("No files found to upload")
-                os.remove(list_file)
+                if list_file and os.path.exists(list_file):
+                    os.remove(list_file)
                 return None
             
             log.info(f"Generated list of {file_count:,} files")
@@ -96,11 +120,19 @@ class FileChunker:
             
         except subprocess.TimeoutExpired:
             log.error(f"File list generation timed out after {self.timeout}s")
-            if os.path.exists(list_file):
+            # Clean up temp files
+            if exclude_file and os.path.exists(exclude_file):
+                os.remove(exclude_file)
+            if list_file and os.path.exists(list_file):
                 os.remove(list_file)
             return None
         except Exception as e:
             log.exception(f"Error generating file list: {e}")
+            # Clean up temp files
+            if exclude_file and os.path.exists(exclude_file):
+                os.remove(exclude_file)
+            if list_file and os.path.exists(list_file):
+                os.remove(list_file)
             return None
     
     def create_chunks(self, list_file, chunk_size=1000):

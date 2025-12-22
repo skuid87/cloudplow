@@ -695,16 +695,65 @@ def do_upload(remote=None):
                         
                         if use_chunking:
                             from utils.chunker import FileChunker
+                            import datetime
                             
                             chunk_size = chunked_config.get('chunk_size', 1000)
                             list_timeout = chunked_config.get('generate_list_timeout', 600)
                             
-                            log.info(f"Chunked upload enabled (chunk_size={chunk_size}) - generating file list for {rclone_config['upload_folder']}")
+                            # Prepare excludes list including cached files (before generating file list)
+                            excludes_for_chunking = rclone_config.get('rclone_excludes', []).copy()
+                            
+                            # Load cached files for weekday runs (same logic as in Uploader)
+                            is_weekend = datetime.datetime.now().weekday() in [5, 6]
+                            if not is_weekend and transferred_files_cache is not None:
+                                try:
+                                    # Load cached files from the cache database
+                                    import sqlite3
+                                    if os.path.exists(transferred_files_cache):
+                                        conn = sqlite3.connect(transferred_files_cache)
+                                        cursor = conn.cursor()
+                                        # Get cached files for this uploader
+                                        cursor.execute(
+                                            "SELECT file_path FROM transferred_files WHERE uploader_name = ?",
+                                            (uploader_remote,)
+                                        )
+                                        cached_files = [row[0] for row in cursor.fetchall()]
+                                        conn.close()
+                                        
+                                        if cached_files:
+                                            log.info(f"Weekday run - adding {len(cached_files)} cached files to excludes for file list generation")
+                                            excludes_for_chunking.extend(cached_files)
+                                except Exception as e:
+                                    log.warning(f"Failed to load cached files for chunking: {e}")
+                            elif is_weekend:
+                                log.info("Weekend run - full scan, no cache excludes")
+                            
+                            # Also check for open files if configured
+                            if uploader_config.get('exclude_open_files', False):
+                                try:
+                                    from utils import path as path_utils
+                                    import glob
+                                    open_files = path_utils.opened_files(rclone_config['upload_folder'])
+                                    # Filter out files that match opened_excludes patterns
+                                    opened_excludes = uploader_config.get('opened_excludes', [])
+                                    files_to_exclude = [
+                                        item.replace(rclone_config['upload_folder'], '')
+                                        for item in open_files
+                                        if not any(excl.lower() in item.lower() for excl in opened_excludes)
+                                    ]
+                                    if files_to_exclude:
+                                        log.info(f"Adding {len(files_to_exclude)} open files to excludes for file list generation")
+                                        for item in files_to_exclude:
+                                            excludes_for_chunking.append(glob.escape(item))
+                                except Exception as e:
+                                    log.warning(f"Failed to check for open files: {e}")
+                            
+                            log.info(f"Chunked upload enabled (chunk_size={chunk_size}) - generating file list with {len(excludes_for_chunking)} excludes")
                             chunker = FileChunker(
                                 conf.configs['core']['rclone_binary_path'],
                                 conf.configs['core']['rclone_config_path'],
                                 rclone_config['upload_folder'],
-                                rclone_config.get('rclone_excludes', []),
+                                excludes_for_chunking,
                                 timeout=list_timeout
                             )
                             

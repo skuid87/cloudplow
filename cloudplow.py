@@ -225,6 +225,7 @@ def init_sa_quota_tracking():
 def cleanup_expired_quotas():
     """Remove quota entries older than 24 hours"""
     global sa_quota_usage
+    global sa_delay
     current_time = time.time()
     
     for uploader in list(sa_quota_usage.keys()):
@@ -233,6 +234,12 @@ def cleanup_expired_quotas():
             if current_time >= reset_time:
                 log.info(f"Quota reset for SA: {os.path.basename(sa_file)}")
                 del sa_quota_usage[uploader][sa_file]
+                
+                # Also unban the SA in sa_delay when quota resets
+                if uploader in sa_delay and sa_delay[uploader] is not None:
+                    if sa_file in sa_delay[uploader]:
+                        sa_delay[uploader][sa_file] = None
+                        log.info(f"Unbanned SA in sa_delay: {os.path.basename(sa_file)}")
         
         # Clean up empty uploader entries
         if not sa_quota_usage[uploader]:
@@ -638,6 +645,9 @@ def do_upload(remote=None):
                         log.error("Failed to pause the Sabnzbd download queue, upload commencing anyway...")
                         notify.send(message="Failed to pause the Sabnzbd download queue, upload commencing anyway...")
 
+                # Check for any expired SA bans before checking available accounts
+                check_suspended_sa(uploader_remote)
+                
                 if sa_delay[uploader_remote] is not None:
                     available_accounts = [account for account, last_ban_time in sa_delay[uploader_remote].items() if
                                           last_ban_time is None]

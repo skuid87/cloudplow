@@ -695,7 +695,6 @@ def do_upload(remote=None):
                         
                         if use_chunking:
                             from utils.chunker import FileChunker
-                            import datetime
                             
                             chunk_size = chunked_config.get('chunk_size', 1000)
                             list_timeout = chunked_config.get('generate_list_timeout', 600)

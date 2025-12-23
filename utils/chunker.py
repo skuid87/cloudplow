@@ -67,7 +67,7 @@ class FileChunker:
             
             # Add filter flags from rclone_extras (apply filters during file list generation)
             # These flags will be removed from the upload command to avoid conflicts with --files-from
-            filter_flags = ['--min-age', '--max-age', '--skip-links']
+            filter_flags = ['--min-age', '--max-age', '--skip-links', '--max-size']
             for flag in filter_flags:
                 if flag in self.rclone_extras:
                     value = self.rclone_extras[flag]

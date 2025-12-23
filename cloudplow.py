@@ -627,7 +627,7 @@ def do_upload(remote=None):
                 chunks = []
                 list_file = None
                 total_files_from_list = 0
-                
+
                 # pause the nzbget queue before starting the upload, if enabled
                 if conf.configs['nzbget']['enabled']:
                     nzbget = Nzbget(conf.configs['nzbget']['url'])
@@ -653,7 +653,7 @@ def do_upload(remote=None):
 
                 # Check for any expired SA bans before checking available accounts
                 check_suspended_sa(uploader_remote)
-                
+
                 if sa_delay[uploader_remote] is not None:
                     available_accounts = [account for account, last_ban_time in sa_delay[uploader_remote].items() if
                                           last_ban_time is None]
@@ -854,7 +854,7 @@ def do_upload(remote=None):
                                 # For chunked uploads, remove flags incompatible with --files-from
                                 if use_chunking:
                                     # Remove filter flags (they were applied during file list generation)
-                                    filter_flags_to_remove = ['--min-age', '--max-age', '--skip-links']
+                                    filter_flags_to_remove = ['--min-age', '--max-age', '--skip-links', '--max-size']
                                     for flag in filter_flags_to_remove:
                                         if flag in dynamic_rclone_config['rclone_extras']:
                                             dynamic_rclone_config['rclone_extras'].pop(flag)
@@ -1009,8 +1009,8 @@ def do_upload(remote=None):
                                 cumulative_metrics['transfer_count'] += transfer_count
                                 cumulative_metrics['total_bytes'] += bytes_uploaded
                                 cumulative_metrics['duration_seconds'] += resp['duration_seconds']
-                                if resp['cached_files_excluded'] > 0:
-                                    cumulative_metrics['cached_files_excluded'] = resp['cached_files_excluded']
+                            if resp['cached_files_excluded'] > 0:
+                                cumulative_metrics['cached_files_excluded'] = resp['cached_files_excluded']
                                 
                                 # Check stage completion status
                                 # Exit code 7 = max-transfer reached, continue to next stage

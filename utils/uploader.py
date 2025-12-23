@@ -148,6 +148,8 @@ class Uploader:
         self.max_transfer_detected = False  # Flag for early termination
         self.max_transfer_detect_time = None  # Time when max-transfer was first detected
         self.early_terminated = False  # Flag to indicate we terminated early due to max-transfer
+        self.last_cache_update_time = 0  # Track last cache update time for time-based updates
+        self.last_cache_update_bytes = 0  # Track bytes at last cache update for size-based updates
         
         # Initialize JSONL logger with rotation if path provided
         if self.json_log_path:
@@ -254,6 +256,8 @@ class Uploader:
         self.is_weekend = datetime.datetime.now().weekday() in [5, 6]
         self.transferred_files = set()
         self.transferred_file_sizes = {}  # Reset file sizes tracking
+        self.last_cache_update_time = upload_start_time  # Initialize to start time
+        self.last_cache_update_bytes = 0  # Reset bytes tracking
         cached_files_count = 0
         rclone_config = self.rclone_config.copy()
 
@@ -430,13 +434,44 @@ class Uploader:
                 # Log to JSONL with RC stats enrichment
                 self._log_completed_file(file_path)
                 
-                # Periodic cache update every 50 files
-                if len(self.transferred_files) % 50 == 0 and self.transfer_cache is not None:
+                # Hybrid cache update strategy for better large file handling
+                # Update if ANY of these conditions are met:
+                # 1. Every 50 files (original logic for many small files)
+                # 2. Every 5 minutes (protects against SA cycling with large files)
+                # 3. Every 10GB transferred (size-based threshold for very large files)
+                current_time = time.time()
+                total_bytes = sum(self.transferred_file_sizes.values())
+                
+                time_since_update = current_time - self.last_cache_update_time
+                bytes_since_update = total_bytes - self.last_cache_update_bytes
+                
+                should_update = (
+                    len(self.transferred_files) % 50 == 0 or  # Every 50 files
+                    time_since_update >= 300 or  # Every 5 minutes (300 seconds)
+                    bytes_since_update >= 10 * 1024 * 1024 * 1024  # Every 10GB
+                )
+                
+                if should_update and self.transfer_cache is not None:
                     if self.is_weekend:
                         self._update_cache_full(self.transferred_files)
                     else:
                         self._update_cache_incremental(self.transferred_files)
-                    log.info(f"Periodic cache update: {len(self.transferred_files)} files saved")
+                    
+                    # Track last update for next comparison
+                    self.last_cache_update_time = current_time
+                    self.last_cache_update_bytes = total_bytes
+                    
+                    # Determine which threshold triggered the update
+                    trigger = []
+                    if len(self.transferred_files) % 50 == 0:
+                        trigger.append(f"{len(self.transferred_files)} files")
+                    if time_since_update >= 300:
+                        trigger.append(f"{int(time_since_update/60)}min elapsed")
+                    if bytes_since_update >= 10 * 1024 * 1024 * 1024:
+                        trigger.append(f"{format_bytes(bytes_since_update)} transferred")
+                    
+                    log.info(f"Cache updated: {len(self.transferred_files)} files, "
+                            f"{format_bytes(total_bytes)} total ({', '.join(trigger)})")
         
         # loop sleep triggers
         for trigger_text, trigger_config in self.rclone_config['rclone_sleeps'].items():

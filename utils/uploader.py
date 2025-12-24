@@ -333,6 +333,22 @@ class Uploader:
             else:
                 self.delayed_trigger = f"Unhandled situation: Exit code: {return_code} - Upload Status: {upload_status}"
 
+            # For chunked uploads: Add ALL files from the chunk to cache (including skipped files)
+            # This prevents redundant checking of files that already exist on destination
+            if success and files_from and return_code == 0 and self.transfer_cache is not None:
+                try:
+                    chunk_files_added = 0
+                    with open(files_from, 'r') as f:
+                        for line in f:
+                            file_path = line.strip()
+                            if file_path:
+                                self.transferred_files.add(file_path)
+                                chunk_files_added += 1
+                    
+                    log.info(f"Chunked upload: Added {chunk_files_added} files to cache (includes both copied and skipped files)")
+                except Exception as e:
+                    log.warning(f"Failed to add chunk files to cache: {e}")
+
             # Update cache after successful transfer
             if success and self.transferred_files and self.transfer_cache is not None:
                 if self.is_weekend:

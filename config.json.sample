@@ -48,7 +48,19 @@
         "port": 47949,
         "rc_url": "http://localhost:5572",
         "refresh_interval": 3,
-        "debug": false
+        "debug": false,
+        "standalone_rc": {
+            "enabled": false,
+            "port": 5572,
+            "rc_addr": "0.0.0.0:5572",
+            "rc_no_auth": true,
+            "rc_user": "",
+            "rc_pass": "",
+            "rc_htpasswd": "",
+            "rc_web_gui": true,
+            "rc_web_gui_no_open_browser": true,
+            "verbose": false
+        }
     },
     "remotes": {
         "google": {

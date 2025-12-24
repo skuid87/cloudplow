@@ -464,6 +464,109 @@ def run_process(task, manager_dict, **kwargs):
 
 
 ############################################################
+# RCLONE RC STANDALONE DAEMON
+############################################################
+
+def is_rclone_rc_running(port=5572):
+    """Check if rclone RC server is already running by attempting to connect to it"""
+    try:
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        # We check localhost since this is where we'd start it
+        result = sock.connect_ex(('127.0.0.1', port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def start_rclone_rc_if_needed():
+    """Start standalone rclone rcd daemon if configured and not already running"""
+    # Check if standalone RC is enabled in config
+    rc_config = conf.configs.get('dashboard', {}).get('standalone_rc', {})
+    if not rc_config.get('enabled', False):
+        log.debug("Standalone rclone RC daemon not enabled in config, skipping auto-start")
+        return False
+    
+    port = rc_config.get('port', 5572)
+    
+    # Check if already running
+    if is_rclone_rc_running(port):
+        log.info(f"Rclone RC daemon is already running on port {port}")
+        return True
+    
+    try:
+        import subprocess
+        rclone_binary = conf.configs['core']['rclone_binary_path']
+        rclone_config = conf.configs['core']['rclone_config_path']
+        
+        log.info("Starting standalone rclone RC daemon (rcd) in background...")
+        
+        # Use rcd command - the dedicated RC daemon
+        cmd = [rclone_binary, 'rcd', f'--config={rclone_config}']
+        
+        # RC address binding
+        rc_addr = rc_config.get('rc_addr', f'0.0.0.0:{port}')
+        cmd.append(f'--rc-addr={rc_addr}')
+        
+        # Authentication - consider security!
+        if rc_config.get('rc_no_auth', False):
+            cmd.append('--rc-no-auth')
+            log.warning("RC server starting with NO AUTHENTICATION - ensure your network is secure!")
+        else:
+            # Use authentication if provided
+            if rc_config.get('rc_user') and rc_config.get('rc_pass'):
+                cmd.extend([
+                    f"--rc-user={rc_config['rc_user']}",
+                    f"--rc-pass={rc_config['rc_pass']}"
+                ])
+                log.info(f"RC server will use authentication with user: {rc_config['rc_user']}")
+            elif rc_config.get('rc_htpasswd'):
+                cmd.append(f"--rc-htpasswd={rc_config['rc_htpasswd']}")
+                log.info("RC server will use htpasswd authentication")
+            else:
+                log.warning("No authentication configured for RC server - consider setting rc_user/rc_pass")
+        
+        # Web GUI
+        if rc_config.get('rc_web_gui', False):
+            cmd.append('--rc-web-gui')
+            if rc_config.get('rc_web_gui_no_open_browser', True):
+                cmd.append('--rc-web-gui-no-open-browser')
+        
+        # Optional: verbose logging for debugging
+        if rc_config.get('verbose', False):
+            cmd.append('-v')
+        
+        # Log the command (without sensitive info)
+        log.debug(f"Starting rcd with command: {' '.join([c for c in cmd if 'pass' not in c.lower()])}")
+        
+        # Start process detached
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        
+        # Give it a moment to start
+        time.sleep(2)
+        
+        if is_rclone_rc_running(port):
+            log.info(f"Rclone RC daemon started successfully on port {port}")
+            if rc_config.get('rc_web_gui'):
+                log.info(f"RC Web GUI available at: http://localhost:{port}")
+            return True
+        else:
+            log.warning("Rclone RC daemon process started but port is not responding")
+            return False
+            
+    except Exception as e:
+        log.warning(f"Failed to auto-start rclone RC daemon: {e}")
+        return False
+
+
+############################################################
 # DASHBOARD AUTO-START
 ############################################################
 
@@ -564,6 +667,9 @@ def do_upload(remote=None):
         
         # Initialize session state tracker for dashboard
         session_tracker = SessionStateTracker(config_dir)
+        
+        # Auto-start standalone rclone RC daemon if configured (before dashboard)
+        start_rclone_rc_if_needed()
         
         # Auto-start dashboard if enabled and not already running
         start_dashboard_if_needed()

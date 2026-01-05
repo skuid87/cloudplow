@@ -918,6 +918,8 @@ def do_upload(remote=None):
                                     log.info(f"=== Starting chunked upload: {len(chunks)} chunks ===")
                                     total_chunk_transfers = 0
                                     total_chunk_bytes = 0
+                                    chunk_trigger_delay = 0
+                                    chunk_trigger_text = ""
                                     
                                     for chunk_idx, (chunk_file, chunk_file_count) in enumerate(chunks, 1):
                                         log.info(f"=== Uploading chunk {chunk_idx}/{len(chunks)} ({chunk_file_count} files) ===")
@@ -930,6 +932,13 @@ def do_upload(remote=None):
                                             # Set the response to the failed chunk response and break
                                             resp = chunk_resp
                                             break
+                                        
+                                        # Check for triggers (rate limits, etc.) - these should cause SA cycling
+                                        if chunk_resp.get('delayed_check', 0) > 0:
+                                            chunk_trigger_delay = chunk_resp['delayed_check']
+                                            chunk_trigger_text = chunk_resp.get('delayed_trigger', '')
+                                            log.warning(f"Chunk {chunk_idx} hit trigger: {chunk_trigger_text}, will cycle service account")
+                                            # Don't break here - let the combined response propagate the trigger
                                         
                                         # Accumulate chunk results
                                         total_chunk_transfers += chunk_resp['transfer_count']
@@ -948,18 +957,21 @@ def do_upload(remote=None):
                                     # Create combined response from all chunks
                                     upload_duration = time.time() - upload_start_time
                                     resp = {
-                                        'success': True,
+                                        'success': True if chunk_trigger_delay == 0 else False,  # Success only if no triggers
                                         'transfer_count': total_chunk_transfers,
                                         'total_bytes': total_chunk_bytes,
-                                        'delayed_check': 0,
-                                        'delayed_trigger': '',
+                                        'delayed_check': chunk_trigger_delay,  # Propagate trigger delay
+                                        'delayed_trigger': chunk_trigger_text,  # Propagate trigger text
                                         'duration_seconds': upload_duration,
                                         'avg_speed_bytes': total_chunk_bytes / upload_duration if upload_duration > 0 else 0,
                                         'is_weekend': stage_uploader.is_weekend,
                                         'cached_files_excluded': 0  # Chunk uploads don't use cache excludes in the same way
                                     }
                                     
-                                    log.info(f"=== All chunks completed: {total_chunk_transfers} files, {format_bytes(total_chunk_bytes)} ===")
+                                    if chunk_trigger_delay > 0:
+                                        log.info(f"=== Chunked upload aborted due to trigger: {chunk_trigger_text} ===")
+                                    else:
+                                        log.info(f"=== All chunks completed: {total_chunk_transfers} files, {format_bytes(total_chunk_bytes)} ===")
                                 else:
                                     # Normal upload (no chunking or not stage 1)
                                     resp = stage_uploader.upload()

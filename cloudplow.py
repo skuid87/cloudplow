@@ -1051,6 +1051,9 @@ def do_upload(remote=None):
                             
                             # === END OF STAGE LOOP ===
                             
+                            # Refresh quota remaining after stage loop (may have been depleted)
+                            sa_quota_remaining = get_sa_remaining_quota(uploader_remote, sa_file)
+                            
                             # Record that this SA was used
                             if sa_file not in cumulative_metrics['sa_used']:
                                 cumulative_metrics['sa_used'].append(sa_file)
@@ -1112,6 +1115,27 @@ def do_upload(remote=None):
                                                     f"Uploads suspended for {resp_delay} hours")
                                         notify.send(message=abort_msg)
                             else:
+                                # Remove ban for service account
+                                sa_delay[uploader_remote][sa_file] = None
+                                
+                                # Check if quota was depleted and more SAs are available
+                                # If so, continue to next SA instead of breaking
+                                if sa_quota_remaining < 10 * 1024**3 and i < (available_accounts_size - 1):
+                                    from utils.uploader import format_bytes, format_duration
+                                    log.info(f"SA {os.path.basename(sa_file)} quota depleted ({format_bytes(sa_quota_remaining)} remaining), "
+                                             f"cycling to next SA ({available_accounts_size - i - 1} remaining)")
+                                    # Send cycling notification
+                                    sa_duration = time.time() - sa_start_time
+                                    sa_msg = (f"Service account {os.path.basename(sa_file)} quota depleted for {uploader_remote}. "
+                                             f"This SA uploaded: {format_bytes(sa_total_uploaded)} across {stage_number} stage(s) "
+                                             f"in {format_duration(sa_duration)}. "
+                                             f"Session total so far: {cumulative_metrics['transfer_count']} files "
+                                             f"({format_bytes(cumulative_metrics['total_bytes'])}). "
+                                             f"Cycling to {os.path.basename(available_accounts[i + 1])} ({available_accounts_size - i - 1} remaining)")
+                                    notify.send(message=sa_msg)
+                                    continue  # Continue to next SA instead of breaking
+                                
+                                # All files completed OR last SA - send completion notification and break
                                 if resp_success:
                                     log.info(f"Upload completed successfully for uploader: {uploader_remote}")
                                     # send successful upload notification with cumulative metrics
@@ -1153,9 +1177,7 @@ def do_upload(remote=None):
                                         notify.send(message=fail_msg)
                                     else:
                                         notify.send(message=f"Upload was not completed successfully for remote: {uploader_remote} (no files transferred)")
-
-                                # Remove ban for service account
-                                sa_delay[uploader_remote][sa_file] = None
+                                
                                 break
                 else:
                     # No service accounts - single upload run

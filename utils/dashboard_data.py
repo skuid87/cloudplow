@@ -317,23 +317,29 @@ class DashboardDataProvider:
             # Calculate average speed (total transferred / total time)
             avg_speed = transferred_bytes / duration_seconds if duration_seconds > 0 else 0
             
-            # Calculate remaining
-            remaining_bytes = max(0, total_bytes - transferred_bytes)
+            # Calculate remaining - handle case where totals might be 0
+            remaining_bytes = max(0, total_bytes - transferred_bytes) if total_bytes > 0 else 0
             
             # Use RC API's ETA if available, otherwise calculate from avg speed
             if current_eta > 0:
                 eta_seconds = current_eta
+            elif total_bytes > 0 and avg_speed > 0:
+                eta_seconds = int(remaining_bytes / avg_speed)
             else:
-                eta_seconds = int(remaining_bytes / avg_speed) if avg_speed > 0 else 0
+                eta_seconds = 0
             
-            # Calculate percentages
+            # Calculate percentages - handle division by zero
             file_percentage = (transferred_files / total_files * 100) if total_files > 0 else 0
             byte_percentage = (transferred_bytes / total_bytes * 100) if total_bytes > 0 else 0
+            
+            # Clamp percentages to 100% max (in case totals are underestimated)
+            file_percentage = min(100.0, file_percentage)
+            byte_percentage = min(100.0, byte_percentage)
             
             return {
                 'total_files': total_files,
                 'transferred_files': transferred_files,
-                'remaining_files': max(0, total_files - transferred_files),
+                'remaining_files': max(0, total_files - transferred_files) if total_files > 0 else 0,
                 'file_percentage': round(file_percentage, 1),
                 
                 'total_bytes': total_bytes,

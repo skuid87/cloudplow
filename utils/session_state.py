@@ -72,15 +72,28 @@ class SessionStateTracker:
         log.debug(f"Updated stage: {stage_number}")
     
     def set_totals(self, total_files, total_bytes):
-        """Set total files and bytes to transfer (from rclone scan)"""
+        """Set total files and bytes to transfer (from rclone scan)
+        Only updates ONCE when totals are not yet set (preserves initial scan totals)
+        This prevents overwriting cumulative totals with per-stage subset totals
+        """
         if not self.session_data.get('active'):
             return
         
-        self.session_data['total_files'] = total_files
-        self.session_data['total_bytes'] = total_bytes
+        current_total_files = self.session_data.get('total_files', 0)
+        current_total_bytes = self.session_data.get('total_bytes', 0)
+        
+        # Only set files if not already set (first scan wins)
+        if current_total_files == 0 and total_files > 0:
+            self.session_data['total_files'] = total_files
+            log.info(f"Initial total files captured: {total_files:,}")
+        
+        # Only set bytes if not already set and new value is non-zero
+        # Skip if new value is 0 (means size unknown, don't overwrite existing)
+        if current_total_bytes == 0 and total_bytes > 0:
+            self.session_data['total_bytes'] = total_bytes
+            log.info(f"Initial total bytes captured: {total_bytes:,}")
         
         self._save()
-        log.info(f"Set session totals: {total_files} files, {total_bytes} bytes")
     
     def update_transferred(self, files_delta, bytes_delta):
         """Update cumulative transferred files and bytes"""
@@ -96,6 +109,16 @@ class SessionStateTracker:
         # Add deltas
         self.session_data['transferred_files'] += files_delta
         self.session_data['transferred_bytes'] += bytes_delta
+        
+        # Validation: warn if transferred exceeds total (indicates totals might be wrong)
+        total_files = self.session_data.get('total_files', 0)
+        total_bytes = self.session_data.get('total_bytes', 0)
+        if total_files > 0 and self.session_data['transferred_files'] > total_files:
+            log.warning(f"Transferred files ({self.session_data['transferred_files']:,}) "
+                       f"exceeds total ({total_files:,}) - totals may need recalculation")
+        if total_bytes > 0 and self.session_data['transferred_bytes'] > total_bytes:
+            log.warning(f"Transferred bytes ({self.session_data['transferred_bytes']:,}) "
+                       f"exceeds total ({total_bytes:,}) - totals may need recalculation")
         
         self._save()
         log.debug(f"Updated transferred: +{files_delta} files, +{bytes_delta} bytes "

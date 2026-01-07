@@ -689,6 +689,10 @@ def do_upload(remote=None):
                             upload_folder=rclone_config['upload_folder']
                         )
                         
+                        # SESSION-LEVEL flag to track if totals have been captured once
+                        # This prevents overwriting cumulative totals with per-stage subset totals
+                        totals_captured = False
+                        
                         # Check if chunked upload is enabled
                         chunked_config = uploader_config.get('chunked_upload', {})
                         use_chunking = chunked_config.get('enabled', False)
@@ -766,8 +770,9 @@ def do_upload(remote=None):
                                         list_file = None
                                 else:
                                     log.info(f"Created {len(chunks)} chunks from {total_files_from_list:,} files")
-                                    # Set totals in session tracker immediately
-                                    session_tracker.set_totals(total_files_from_list, 0)  # Size unknown until upload
+                                    # Set totals in session tracker immediately (file count known, size will be captured later)
+                                    session_tracker.set_totals(total_files_from_list, 0)
+                                    totals_captured = True  # Mark file count as captured (size will come from RC API)
                         
                         for i in range(available_accounts_size):
                             sa_file = available_accounts[i]
@@ -803,7 +808,7 @@ def do_upload(remote=None):
                             resp_trigger = ""
                             resp_success = False
                             session_start_time = time.time()
-                            totals_captured = False  # Track if we've captured total files/bytes
+                            # Note: totals_captured is now at session level (see above)
                             
                             while sa_quota_remaining > 10 * 1024**3:  # Continue while >10GB remains
                                 from utils.distribution import format_bytes
@@ -894,8 +899,9 @@ def do_upload(remote=None):
                                 # Start the upload
                                 upload_start_time = time.time()
                                 
-                                # Capture total files BEFORE stage starts (from initial rclone scan)
-                                if not totals_captured and rc_url and stage_number == 1:
+                                # Capture total files BEFORE first stage starts (from initial rclone scan)
+                                # Only capture ONCE per session (first SA, first stage)
+                                if not totals_captured and rc_url and stage_number == 1 and i == 0:
                                     # Wait a bit for rclone to populate stats
                                     time.sleep(2)
                                     try:
@@ -905,10 +911,10 @@ def do_upload(remote=None):
                                             total_files = stats.get('listed', 0) or stats.get('totalChecks', 0)
                                             total_bytes = stats.get('totalBytes', 0)
                                             
-                                            if total_files > 0:
+                                            if total_files > 0 or total_bytes > 0:
                                                 session_tracker.set_totals(total_files, total_bytes)
                                                 totals_captured = True
-                                                log.info(f"Captured session totals: {total_files} files, {format_bytes(total_bytes)}")
+                                                log.info(f"Captured initial session totals: {total_files} files, {format_bytes(total_bytes)}")
                                     except Exception as e:
                                         log.debug(f"Could not capture totals from RC API: {e}")
                                 
@@ -983,9 +989,9 @@ def do_upload(remote=None):
                                 transfer_count = resp['transfer_count']
                                 bytes_uploaded = resp['total_bytes']
                                 
-                                # Try to capture total files from RC API (only once, after first stage)
-                                # Use the "listed" field which shows files found during scan
-                                if not totals_captured and rc_url:
+                                # Try to capture total files from RC API after first stage (fallback if not captured before)
+                                # Only capture ONCE per session (first SA only)
+                                if not totals_captured and rc_url and i == 0:
                                     try:
                                         response = requests.post(f"{rc_url}/core/stats", timeout=5)
                                         if response.status_code == 200:
@@ -996,10 +1002,11 @@ def do_upload(remote=None):
                                             total_bytes = stats.get('totalBytes', 0)
                                             
                                             # If we have meaningful totals, update session
-                                            if total_files > 0:
+                                            if total_files > 0 or total_bytes > 0:
                                                 session_tracker.set_totals(total_files, total_bytes)
                                                 totals_captured = True
-                                                log.info(f"Captured session totals from RC: {total_files} files, {format_bytes(total_bytes)}")
+                                                log.info(f"Captured session totals from RC (after stage): {total_files} files, "
+                                                        f"{format_bytes(total_bytes) if total_bytes > 0 else 'size unknown'}")
                                     except Exception as e:
                                         log.debug(f"Could not capture totals from RC API: {e}")
                                 

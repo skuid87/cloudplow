@@ -788,8 +788,8 @@ def do_upload(remote=None):
                             # Check remaining quota for this SA
                             sa_quota_remaining = get_sa_remaining_quota(uploader_remote, sa_file)
                             
-                            # Skip SA if insufficient quota
-                            if sa_quota_remaining < 1 * 1024**3:  # Less than 1GB
+                            # Skip SA if insufficient quota (must match while loop threshold of 10GB)
+                            if sa_quota_remaining < 10 * 1024**3:  # Less than 10GB
                                 from utils.distribution import format_bytes
                                 log.warning(f"SA {os.path.basename(sa_file)} has insufficient quota ({format_bytes(sa_quota_remaining)}), skipping")
                                 # Mark as temporarily suspended until quota resets
@@ -1028,8 +1028,8 @@ def do_upload(remote=None):
                                 cumulative_metrics['transfer_count'] += transfer_count
                                 cumulative_metrics['total_bytes'] += bytes_uploaded
                                 cumulative_metrics['duration_seconds'] += resp['duration_seconds']
-                            if resp['cached_files_excluded'] > 0:
-                                cumulative_metrics['cached_files_excluded'] = resp['cached_files_excluded']
+                                if resp['cached_files_excluded'] > 0:
+                                    cumulative_metrics['cached_files_excluded'] = resp['cached_files_excluded']
                                 
                                 # Check stage completion status
                                 # Exit code 7 = max-transfer reached, continue to next stage
